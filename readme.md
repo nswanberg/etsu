@@ -94,68 +94,34 @@ If you have an older local install using `com.nswanberg.etsu`, the installer wil
 
 ### Installing on another Mac
 
-The simplest path is to run the macOS setup script, which can take a direct Postgres DSN or read one from 1Password:
+Use the installer script. It stops any existing ETSU process, backs up the live config and SQLite database from the default macOS paths, reuses the current device identity, rebuilds, and installs the LaunchAgent.
+
+It resolves the Supabase/Postgres DSN from the first place that has one:
+
+1. `ETSU_POSTGRES_URL`
+2. `ETSU_POSTGRES_URL_OP_REF`
+3. existing `~/Library/Application Support/com.seatedro.etsu/config.toml`
+4. `~/Repositories/ledger/ops/ledger.env`
+5. `~/Third-party-repositories/ledger/ops/ledger.env`
+
+From the repo root:
 
 ```bash
-ETSU_POSTGRES_URL="postgresql://user:password@host:5432/postgres" ./scripts/setup_macos.sh
+./setup_macos.sh
 ```
 
-or
+If you are already in `target/release`, run:
 
 ```bash
-ETSU_POSTGRES_URL_OP_REF="op://Vault/Item/postgres_url" ./scripts/setup_macos.sh
+../../setup_macos.sh
 ```
 
-That script:
-
-- creates `~/Library/Application Support/com.seatedro.etsu/config.toml` from the safe template if it does not exist
-- updates `[database].postgres_url` when provided
-- preserves the machine's existing identity unless you explicitly set `ETSU_DEVICE_ID` or `ETSU_DEVICE_NAME`
-- builds ETSU in release mode
-- installs or refreshes the LaunchAgent
-
-If you want to do it manually:
-
-1. Clone the repo on that Mac and build ETSU:
+Optional overrides:
 
 ```bash
-git clone https://github.com/nswanberg/etsu.git
-cd etsu
-cargo build --release
-```
-
-2. Create the macOS config file from the safe template:
-
-```bash
-mkdir -p "$HOME/Library/Application Support/com.seatedro.etsu"
-cp config.example.toml "$HOME/Library/Application Support/com.seatedro.etsu/config.toml"
-```
-
-3. Edit `~/Library/Application Support/com.seatedro.etsu/config.toml` and set `[database].postgres_url` to the shared Supabase DSN. You can either set `[identity]` explicitly or leave it commented out and let ETSU generate a unique `device_id` and `device_name` on first launch.
-4. Install or refresh the LaunchAgent:
-
-```bash
-./scripts/install_launchd.sh
-```
-
-5. Verify the agent and logs:
-
-```bash
-launchctl print "gui/$(id -u)/com.seatedro.etsu"
-tail -n 50 ~/Library/Logs/etsu.launchd.err.log
-```
-
-6. Verify remote writes once the Supabase DSN is configured:
-
-```sql
-select device_id, device_name, count(*) as intervals, max(timestamp) as latest_interval
-from metrics
-group by device_id, device_name
-order by latest_interval desc;
-
-select device_id, device_name, last_updated, total_keypresses, total_mouse_clicks, total_scroll_steps
-from metrics_summary
-order by last_updated desc;
+ETSU_POSTGRES_URL="postgresql://user:password@host:5432/postgres" ./setup_macos.sh
+ETSU_POSTGRES_URL_OP_REF="op://Vault/Item/postgres_url" ./setup_macos.sh
+ETSU_BACKUP_DIR="$HOME/Dropbox/Records/PersonalData/Etsu/m2" ./setup_macos.sh
 ```
 
 ### Viewing Statistics

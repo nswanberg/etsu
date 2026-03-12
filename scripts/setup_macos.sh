@@ -4,15 +4,74 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PRIMARY_LABEL="com.seatedro.etsu"
+LEGACY_LABEL="com.nswanberg.etsu"
 APP_SUPPORT_DIR="$HOME/Library/Application Support/com.seatedro.etsu"
 CONFIG_PATH="$APP_SUPPORT_DIR/config.toml"
 EXAMPLE_CONFIG_PATH="$REPO_ROOT/config.example.toml"
 LOCAL_DB_PATH="$APP_SUPPORT_DIR/etsu.db"
+BACKUP_ROOT="${ETSU_BACKUP_DIR:-$APP_SUPPORT_DIR/backups}"
 POSTGRES_URL="${ETSU_POSTGRES_URL:-}"
 POSTGRES_URL_OP_REF="${ETSU_POSTGRES_URL_OP_REF:-}"
 DEVICE_ID="${ETSU_DEVICE_ID:-}"
 DEVICE_NAME="${ETSU_DEVICE_NAME:-}"
 SKIP_BUILD="${ETSU_SKIP_BUILD:-0}"
+LEDGER_ENV_PATH="${ETSU_LEDGER_ENV_PATH:-}"
+ETSU_BIN_PATH="$REPO_ROOT/target/release/etsu"
+BACKUP_DIR=""
+POSTGRES_URL_SOURCE="none"
+
+note() {
+  printf '%s\n' "$*"
+}
+
+warn() {
+  printf '%s\n' "$*" >&2
+}
+
+read_env_var_from_file() {
+  local file_path="$1"
+  local key="$2"
+
+  [[ -f "$file_path" ]] || return 1
+
+  python3 - "$file_path" "$key" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+
+for raw_line in path.read_text().splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    current_key, value = line.split("=", 1)
+    if current_key.strip() != key:
+        continue
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    print(value)
+    break
+PY
+}
+
+read_existing_postgres_url() {
+  [[ -f "$CONFIG_PATH" ]] || return 1
+
+  python3 - "$CONFIG_PATH" <<'PY'
+from pathlib import Path
+import sys
+import tomllib
+
+path = Path(sys.argv[1])
+data = tomllib.loads(path.read_text())
+value = data.get("database", {}).get("postgres_url", "")
+if value:
+    print(value)
+PY
+}
 
 escape_toml_string() {
   local value="$1"
@@ -81,23 +140,162 @@ upsert_key() {
 
 resolve_postgres_url() {
   if [[ -n "$POSTGRES_URL" ]]; then
+    POSTGRES_URL_SOURCE="ETSU_POSTGRES_URL"
     return
   fi
 
   if [[ -n "$POSTGRES_URL_OP_REF" ]]; then
     if ! command -v op >/dev/null 2>&1; then
-      echo "ETSU_POSTGRES_URL_OP_REF was set, but the 1Password CLI (op) is not installed." >&2
+      warn "ETSU_POSTGRES_URL_OP_REF was set, but the 1Password CLI (op) is not installed."
       exit 1
     fi
     POSTGRES_URL="$(op read "$POSTGRES_URL_OP_REF")"
+    POSTGRES_URL_SOURCE="$POSTGRES_URL_OP_REF"
+    return
   fi
+
+  POSTGRES_URL="$(read_existing_postgres_url || true)"
+  if [[ -n "$POSTGRES_URL" ]]; then
+    POSTGRES_URL_SOURCE="$CONFIG_PATH"
+    return
+  fi
+
+  local candidate_paths=()
+  if [[ -n "$LEDGER_ENV_PATH" ]]; then
+    candidate_paths+=("$LEDGER_ENV_PATH")
+  fi
+  candidate_paths+=(
+    "$HOME/Repositories/ledger/ops/ledger.env"
+    "$HOME/Third-party-repositories/ledger/ops/ledger.env"
+  )
+
+  local candidate_path
+  for candidate_path in "${candidate_paths[@]}"; do
+    [[ -n "$candidate_path" ]] || continue
+    POSTGRES_URL="$(read_env_var_from_file "$candidate_path" "LEDGER_ETSU_SUPABASE_DSN" || true)"
+    if [[ -n "$POSTGRES_URL" ]]; then
+      POSTGRES_URL_SOURCE="$candidate_path"
+      return
+    fi
+  done
+}
+
+stop_agent() {
+  local label="$1"
+  local plist_path="$HOME/Library/LaunchAgents/$label.plist"
+
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  if [[ -f "$plist_path" ]]; then
+    launchctl bootout "gui/$(id -u)" "$plist_path" 2>/dev/null || true
+  fi
+}
+
+stop_manual_processes() {
+  local pids
+  pids="$(pgrep -f "$ETSU_BIN_PATH" || true)"
+
+  if [[ -z "$pids" ]]; then
+    return
+  fi
+
+  note "Stopping existing ETSU process(es) for $ETSU_BIN_PATH"
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill "$pid" 2>/dev/null || true
+  done <<< "$pids"
+
+  sleep 1
+
+  pids="$(pgrep -f "$ETSU_BIN_PATH" || true)"
+  if [[ -n "$pids" ]]; then
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      kill -9 "$pid" 2>/dev/null || true
+    done <<< "$pids"
+  fi
+}
+
+stop_existing_etsu() {
+  stop_agent "$LEGACY_LABEL"
+  stop_agent "$PRIMARY_LABEL"
+  stop_manual_processes
+}
+
+init_backup_dir() {
+  BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$BACKUP_DIR"
+}
+
+backup_file_if_present() {
+  local file_path="$1"
+
+  [[ -f "$file_path" ]] || return
+  cp -p "$file_path" "$BACKUP_DIR/"
+}
+
+write_backup_stats() {
+  [[ -f "$LOCAL_DB_PATH" ]] || return
+  command -v sqlite3 >/dev/null 2>&1 || return
+
+  sqlite3 "$LOCAL_DB_PATH" \
+    "select count(*) as rows, min(timestamp) as first_ts, max(timestamp) as last_ts, sum(keypresses) as total_keys, sum(mouse_clicks) as total_clicks, sum(scroll_steps) as total_scrolls from metrics;" \
+    > "$BACKUP_DIR/etsu.db.metrics.txt"
+}
+
+backup_existing_state() {
+  init_backup_dir
+  backup_file_if_present "$CONFIG_PATH"
+  backup_file_if_present "$LOCAL_DB_PATH"
+  write_backup_stats
 }
 
 run_build() {
   if [[ "$SKIP_BUILD" == "1" ]]; then
     return
   fi
-  cargo build --release
+  cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml"
+}
+
+latest_log_path() {
+  find "$APP_SUPPORT_DIR" -maxdepth 1 -type f -name 'etsu.log.*' -print | sort | tail -n 1
+}
+
+print_startup_status() {
+  local log_path
+  local startup_lines
+  local _attempt
+
+  for _attempt in 1 2 3 4 5; do
+    log_path="$(latest_log_path)"
+
+    if [[ -f "$log_path" ]]; then
+      startup_lines="$(tail -n 120 "$log_path")"
+
+      if grep -Fq "Remote Postgres pool created." <<< "$startup_lines"; then
+        note "Remote sync: connected"
+        return
+      fi
+
+      if grep -Fq "No remote Postgres URL configured." <<< "$startup_lines"; then
+        note "Remote sync: disabled (no postgres_url configured)"
+        return
+      fi
+
+      if grep -Fq "Failed to connect to remote Postgres DB:" <<< "$startup_lines"; then
+        warn "Remote sync: connection failed"
+        grep -F "Failed to connect to remote Postgres DB:" <<< "$startup_lines" | tail -n 1 >&2
+        return
+      fi
+    fi
+
+    sleep 1
+  done
+
+  if [[ -f "$log_path" ]]; then
+    note "Remote sync: check $log_path"
+  else
+    warn "No ETSU log file found yet at $log_path"
+  fi
 }
 
 print_next_steps() {
@@ -105,6 +303,7 @@ print_next_steps() {
 ETSU macOS setup complete.
 Config file: $CONFIG_PATH
 Local SQLite DB: $LOCAL_DB_PATH
+Backup directory: $BACKUP_DIR
 
 Verify the agent:
   launchctl print "gui/$(id -u)/com.seatedro.etsu"
@@ -112,19 +311,11 @@ Verify the agent:
 
 Verify local device-tagged writes:
   sqlite3 "$LOCAL_DB_PATH" "select device_id, device_name, last_updated, total_keypresses, total_mouse_clicks, total_scroll_steps from metrics_summary order by last_updated desc;"
-
-Verify remote writes with psql once the Supabase DSN is configured:
-  select device_id, device_name, count(*) as intervals, max(timestamp) as latest_interval
-  from metrics
-  group by device_id, device_name
-  order by latest_interval desc;
-
-  select device_id, device_name, last_updated, total_keypresses, total_mouse_clicks, total_scroll_steps
-  from metrics_summary
-  order by last_updated desc;
 EOF
 }
 
+stop_existing_etsu
+backup_existing_state
 ensure_config_file
 resolve_postgres_url
 
@@ -142,4 +333,6 @@ fi
 
 run_build
 "$SCRIPT_DIR/install_launchd.sh"
+note "Postgres DSN source: $POSTGRES_URL_SOURCE"
+print_startup_status
 print_next_steps

@@ -31,6 +31,32 @@ stop_agent() {
   fi
 }
 
+stop_binary_processes() {
+  local bin_path="$1"
+  local pids
+  pids="$(pgrep -f "$bin_path" || true)"
+
+  if [[ -z "$pids" ]]; then
+    return
+  fi
+
+  echo "Stopping existing ETSU process(es) for $bin_path"
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill "$pid" 2>/dev/null || true
+  done <<< "$pids"
+
+  sleep 1
+
+  pids="$(pgrep -f "$bin_path" || true)"
+  if [[ -n "$pids" ]]; then
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      kill -9 "$pid" 2>/dev/null || true
+    done <<< "$pids"
+  fi
+}
+
 backup_legacy_plist() {
   if [[ -f "$LEGACY_PLIST_PATH" ]]; then
     local backup_path="${LEGACY_PLIST_PATH}.bak.$(date +%Y%m%d%H%M%S)"
@@ -44,6 +70,7 @@ mkdir -p "$LAUNCH_AGENTS_DIR" "$LOG_DIR" "$APP_SUPPORT_DIR"
 stop_agent "$LEGACY_LABEL" "$LEGACY_PLIST_PATH"
 backup_legacy_plist
 stop_agent "$PRIMARY_LABEL" "$PLIST_PATH"
+stop_binary_processes "$ETSU_BIN_PATH"
 
 cat >"$PLIST_PATH" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
