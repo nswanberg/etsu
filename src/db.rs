@@ -1,4 +1,4 @@
-use crate::config::RemoteDatabaseSettings;
+use crate::config::{DeviceIdentity, RemoteDatabaseSettings};
 use crate::error::Result;
 use sea_query::{Alias, Expr, Iden, PostgresQueryBuilder, Query, SqliteQueryBuilder};
 use sea_query_binder::SqlxBinder;
@@ -20,6 +20,8 @@ enum MetricsIden {
     MouseDistanceIn,
     MouseDistanceMi,
     ScrollSteps,
+    DeviceId,
+    DeviceName,
     #[allow(dead_code)]
     Timestamp,
 }
@@ -28,7 +30,7 @@ enum MetricsIden {
 #[iden = "metrics_summary"]
 enum MetricsSummaryIden {
     Table,
-    Id,
+    DeviceId,
     #[allow(dead_code)]
     LastUpdated,
     TotalKeypresses,
@@ -116,13 +118,13 @@ pub async fn run_migrations(
 }
 
 #[instrument(skip(pool))]
-pub async fn load_initial_totals(pool: &Pool<Sqlite>) -> Result<(usize, usize, usize, f64)> {
+pub async fn load_initial_totals(pool: &Pool<Sqlite>, device_id: &str) -> Result<(usize, usize, usize, f64)> {
     // First try loading from the summary table
-    match load_initial_totals_from_summary(pool).await {
+    match load_initial_totals_from_summary(pool, device_id).await {
         Ok(totals) => Ok(totals),
         Err(e) => {
             warn!("Failed to load totals from summary table: {}. Falling back to aggregating metrics table.", e);
-            load_initial_totals_from_metrics(pool).await
+            load_initial_totals_from_metrics(pool, device_id).await
         }
     }
 }
@@ -130,6 +132,7 @@ pub async fn load_initial_totals(pool: &Pool<Sqlite>) -> Result<(usize, usize, u
 #[instrument(skip(pool))]
 async fn load_initial_totals_from_metrics(
     pool: &Pool<Sqlite>,
+    device_id: &str,
 ) -> Result<(usize, usize, usize, f64)> {
     info!("Loading initial totals by aggregating metrics table...");
     let query = Query::select()
@@ -150,6 +153,7 @@ async fn load_initial_totals_from_metrics(
             Alias::new("total_distance"),
         )
         .from(MetricsIden::Table)
+        .and_where(Expr::col(MetricsIden::DeviceId).eq(device_id))
         .to_owned();
 
     let (sql, values) = query.build_sqlx(SqliteQueryBuilder);
@@ -179,6 +183,7 @@ async fn load_initial_totals_from_metrics(
 #[instrument(skip(pool))]
 async fn load_initial_totals_from_summary(
     pool: &Pool<Sqlite>,
+    device_id: &str,
 ) -> Result<(usize, usize, usize, f64)> {
     info!("Loading initial totals from metrics_summary table...");
     let query = Query::select()
@@ -189,7 +194,7 @@ async fn load_initial_totals_from_summary(
             MetricsSummaryIden::TotalMouseTravelIn,
         ])
         .from(MetricsSummaryIden::Table)
-        .and_where(Expr::col(MetricsSummaryIden::Id).eq(1))
+        .and_where(Expr::col(MetricsSummaryIden::DeviceId).eq(device_id))
         .limit(1)
         .to_owned();
 
@@ -214,15 +219,72 @@ async fn load_initial_totals_from_summary(
             Ok((keys as usize, clicks as usize, scrolls as usize, distance))
         }
         None => {
-            warn!("Metrics summary row (ID=1) not found! Initializing totals to zero. Please check migrations.");
+            warn!("Metrics summary row for device {} not found! Initializing totals to zero. Please check migrations.", device_id);
             Ok((0, 0, 0, 0.0))
         }
     }
 }
 
+#[instrument(skip(pool, identity))]
+pub async fn backfill_sqlite_identity(pool: &Pool<Sqlite>, identity: &DeviceIdentity) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE metrics
+        SET device_id = ?, device_name = ?
+        WHERE device_id IS NULL OR device_id = ''
+        "#,
+    )
+    .bind(&identity.device_id)
+    .bind(&identity.device_name)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO metrics_summary (
+            device_id,
+            device_name,
+            last_updated,
+            total_keypresses,
+            total_mouse_clicks,
+            total_mouse_travel_in,
+            total_mouse_travel_mi,
+            total_scroll_steps
+        )
+        SELECT
+            ?,
+            ?,
+            COALESCE(MAX(timestamp), CURRENT_TIMESTAMP),
+            COALESCE(SUM(keypresses), 0),
+            COALESCE(SUM(mouse_clicks), 0),
+            COALESCE(SUM(mouse_distance_in), 0),
+            COALESCE(SUM(mouse_distance_mi), 0),
+            COALESCE(SUM(scroll_steps), 0)
+        FROM metrics
+        WHERE device_id = ?
+        ON CONFLICT(device_id) DO UPDATE SET
+            device_name = excluded.device_name,
+            last_updated = excluded.last_updated,
+            total_keypresses = excluded.total_keypresses,
+            total_mouse_clicks = excluded.total_mouse_clicks,
+            total_mouse_travel_in = excluded.total_mouse_travel_in,
+            total_mouse_travel_mi = excluded.total_mouse_travel_mi,
+            total_scroll_steps = excluded.total_scroll_steps
+        "#,
+    )
+    .bind(&identity.device_id)
+    .bind(&identity.device_name)
+    .bind(&identity.device_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 async fn persist_metrics_sqlite_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     data: &MetricsData,
+    identity: &DeviceIdentity,
 ) -> Result<()> {
     let distance_mi = data.mouse_distance_in / 63360.0;
 
@@ -235,6 +297,8 @@ async fn persist_metrics_sqlite_in_tx(
             MetricsIden::ScrollSteps,
             MetricsIden::MouseDistanceIn,
             MetricsIden::MouseDistanceMi,
+            MetricsIden::DeviceId,
+            MetricsIden::DeviceName,
         ])
         .values_panic([
             (data.keypresses as i64).into(),
@@ -242,6 +306,8 @@ async fn persist_metrics_sqlite_in_tx(
             (data.scroll_steps as i64).into(),
             data.mouse_distance_in.into(),
             distance_mi.into(),
+            identity.device_id.clone().into(),
+            identity.device_name.clone().into(),
         ]);
     let (sql_metrics, values_metrics) = query_metrics.build_sqlx(SqliteQueryBuilder);
     sqlx::query_with(&sql_metrics, values_metrics)
@@ -254,6 +320,7 @@ async fn persist_metrics_sqlite_in_tx(
 async fn persist_metrics_postgres_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     data: &MetricsData,
+    identity: &DeviceIdentity,
 ) -> Result<()> {
     let distance_mi = data.mouse_distance_in / 63360.0;
 
@@ -266,6 +333,8 @@ async fn persist_metrics_postgres_in_tx(
             MetricsIden::ScrollSteps,
             MetricsIden::MouseDistanceIn,
             MetricsIden::MouseDistanceMi,
+            MetricsIden::DeviceId,
+            MetricsIden::DeviceName,
         ])
         .values_panic([
             (data.keypresses as i64).into(),
@@ -273,6 +342,8 @@ async fn persist_metrics_postgres_in_tx(
             (data.scroll_steps as i64).into(),
             data.mouse_distance_in.into(),
             distance_mi.into(),
+            identity.device_id.clone().into(),
+            identity.device_name.clone().into(),
         ]);
     let (sql_metrics, values_metrics) = query_metrics.build_sqlx(PostgresQueryBuilder);
     sqlx::query_with(&sql_metrics, values_metrics)
@@ -283,7 +354,11 @@ async fn persist_metrics_postgres_in_tx(
 }
 
 #[instrument(skip(pool, data), fields(db_type = "sqlite"))]
-pub async fn persist_metrics_sqlite(pool: &Pool<Sqlite>, data: &MetricsData) -> Result<()> {
+pub async fn persist_metrics_sqlite(
+    pool: &Pool<Sqlite>,
+    data: &MetricsData,
+    identity: &DeviceIdentity,
+) -> Result<()> {
     if data.keypresses == 0
         && data.mouse_clicks == 0
         && data.scroll_steps == 0
@@ -292,11 +367,15 @@ pub async fn persist_metrics_sqlite(pool: &Pool<Sqlite>, data: &MetricsData) -> 
         return Ok(());
     }
 
-    persist_metrics_transactional_sqlite(pool, data).await
+    persist_metrics_transactional_sqlite(pool, data, identity).await
 }
 
 #[instrument(skip(pool, data), fields(db_type = "postgres"))]
-pub async fn persist_metrics_postgres(pool: &Pool<Postgres>, data: &MetricsData) -> Result<()> {
+pub async fn persist_metrics_postgres(
+    pool: &Pool<Postgres>,
+    data: &MetricsData,
+    identity: &DeviceIdentity,
+) -> Result<()> {
     if data.keypresses == 0
         && data.mouse_clicks == 0
         && data.scroll_steps == 0
@@ -305,16 +384,17 @@ pub async fn persist_metrics_postgres(pool: &Pool<Postgres>, data: &MetricsData)
         return Ok(());
     }
 
-    persist_metrics_transactional_postgres(pool, data).await
+    persist_metrics_transactional_postgres(pool, data, identity).await
 }
 
 #[instrument(skip(pool, data), fields(db_type = "sqlite"))]
 pub async fn persist_metrics_transactional_sqlite(
     pool: &Pool<Sqlite>,
     data: &MetricsData,
+    identity: &DeviceIdentity,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    let result = persist_metrics_sqlite_in_tx(&mut tx, data).await;
+    let result = persist_metrics_sqlite_in_tx(&mut tx, data, identity).await;
 
     match result {
         Ok(_) => {
@@ -337,9 +417,10 @@ pub async fn persist_metrics_transactional_sqlite(
 pub async fn persist_metrics_transactional_postgres(
     pool: &Pool<Postgres>,
     data: &MetricsData,
+    identity: &DeviceIdentity,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    let result = persist_metrics_postgres_in_tx(&mut tx, data).await;
+    let result = persist_metrics_postgres_in_tx(&mut tx, data, identity).await;
 
     match result {
         Ok(_) => {

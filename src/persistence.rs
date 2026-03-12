@@ -1,3 +1,4 @@
+use crate::config::DeviceIdentity;
 use crate::db::{self, MetricsData};
 use crate::error::Result;
 use crate::state::MetricsState;
@@ -13,6 +14,7 @@ pub async fn save_metrics_periodically(
     state: Arc<MetricsState>,
     sqlite_pool: Pool<Sqlite>,
     pg_pool_option: Option<Pool<Postgres>>,
+    identity: DeviceIdentity,
     saving_interval: Duration,
 ) -> Result<()> {
     debug!(
@@ -21,7 +23,11 @@ pub async fn save_metrics_periodically(
     );
     let mut interval_timer = time::interval(saving_interval);
 
-    match db::load_initial_totals(&sqlite_pool).await {
+    if let Err(e) = db::backfill_sqlite_identity(&sqlite_pool, &identity).await {
+        error!("Failed to backfill local SQLite device identity: {}", e);
+    }
+
+    match db::load_initial_totals(&sqlite_pool, &identity.device_id).await {
         Ok((keys, clicks, scrolls, distance)) => {
             state.total.keypresses.store(keys, Ordering::Relaxed);
             state.total.mouse_clicks.store(clicks, Ordering::Relaxed);
@@ -59,12 +65,12 @@ pub async fn save_metrics_periodically(
                 keys, clicks, scrolls, distance
             );
 
-            if let Err(e) = db::persist_metrics_sqlite(&sqlite_pool, &data_to_save).await {
+            if let Err(e) = db::persist_metrics_sqlite(&sqlite_pool, &data_to_save, &identity).await {
                 error!("Failed to persist metrics to local SQLite: {}", e);
             }
 
             if let Some(ref pg_pool) = pg_pool_option {
-                if let Err(e) = db::persist_metrics_postgres(pg_pool, &data_to_save).await {
+                if let Err(e) = db::persist_metrics_postgres(pg_pool, &data_to_save, &identity).await {
                     error!("Failed to persist metrics to remote Postgres: {}", e);
                 }
             }

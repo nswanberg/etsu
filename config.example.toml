@@ -2,7 +2,19 @@
 
 [database]
 # Your postgres database url, if empty only local sqlite db will be used
-postgres_url = "postgresql://user:password@host:port/{{db_name}}"
+# Example:
+# postgres_url = "postgresql://user:password@host:port/postgres"
+postgres_url = ""
+
+[identity]
+# Stable per-device identifier and display name.
+# Leave these commented out to have ETSU generate/persist a UUID and use the
+# Mac ComputerName on first launch.
+# device_id = "device-your-machine"
+# device_name = "Your Mac"
+
+# Log level filter (e.g., "info", "warn")
+log_level = "info"
 
 [intervals_ms]
 # How often to calculate distance from latest mouse position (ms)
@@ -11,6 +23,3 @@ processing = 250
 saving = 60000 # 60 seconds
 # How often to update the system tray UI (ms)
 ui_update = 5000 # 5 seconds
-
-# Log level filter (e.g., "info", "warn")
-log_level = "info"

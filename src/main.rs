@@ -48,6 +48,14 @@ async fn main() -> Result<()> {
         .init();
 
     info!("Loaded configuration");
+    let identity = settings.device_identity().map_err(|e| {
+        eprintln!("FATAL: Failed to resolve ETSU device identity: {}", e);
+        e
+    })?;
+    info!(
+        "Using device identity: {} ({})",
+        identity.device_name, identity.device_id
+    );
 
     if let Err(e) = platform::initialize_monitor_info() {
         error!("Failed to initialize monitor info using GLFW: {}. Distance calculation might be inaccurate or use defaults.", e);
@@ -101,6 +109,7 @@ async fn main() -> Result<()> {
     let saving_interval = settings.saving_interval();
     let sqlite_pool_clone = sqlite_pool.clone();
     let pg_pool_option_clone = pg_pool_option.clone();
+    let identity_clone = identity.clone();
 
     let mut shutdown_rx2 = shutdown_tx.subscribe();
     let persistence_handle = tokio::spawn(async move {
@@ -109,6 +118,7 @@ async fn main() -> Result<()> {
                 metrics_state_clone,
                 sqlite_pool_clone,
                 pg_pool_option_clone,
+                identity_clone,
                 saving_interval,
             ) => res,
             _ = shutdown_rx2.recv() => {
