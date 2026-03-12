@@ -94,6 +94,28 @@ If you have an older local install using `com.nswanberg.etsu`, the installer wil
 
 ### Installing on another Mac
 
+The simplest path is to run the macOS setup script, which can take a direct Postgres DSN or read one from 1Password:
+
+```bash
+ETSU_POSTGRES_URL="postgresql://user:password@host:5432/postgres" ./scripts/setup_macos.sh
+```
+
+or
+
+```bash
+ETSU_POSTGRES_URL_OP_REF="op://Vault/Item/postgres_url" ./scripts/setup_macos.sh
+```
+
+That script:
+
+- creates `~/Library/Application Support/com.seatedro.etsu/config.toml` from the safe template if it does not exist
+- updates `[database].postgres_url` when provided
+- preserves the machine's existing identity unless you explicitly set `ETSU_DEVICE_ID` or `ETSU_DEVICE_NAME`
+- builds ETSU in release mode
+- installs or refreshes the LaunchAgent
+
+If you want to do it manually:
+
 1. Clone the repo on that Mac and build ETSU:
 
 ```bash
@@ -121,6 +143,19 @@ cp config.example.toml "$HOME/Library/Application Support/com.seatedro.etsu/conf
 ```bash
 launchctl print "gui/$(id -u)/com.seatedro.etsu"
 tail -n 50 ~/Library/Logs/etsu.launchd.err.log
+```
+
+6. Verify remote writes once the Supabase DSN is configured:
+
+```sql
+select device_id, device_name, count(*) as intervals, max(timestamp) as latest_interval
+from metrics
+group by device_id, device_name
+order by latest_interval desc;
+
+select device_id, device_name, last_updated, total_keypresses, total_mouse_clicks, total_scroll_steps
+from metrics_summary
+order by last_updated desc;
 ```
 
 ### Viewing Statistics
