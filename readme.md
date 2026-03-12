@@ -101,8 +101,12 @@ It resolves the Supabase/Postgres DSN from the first place that has one:
 1. `ETSU_POSTGRES_URL`
 2. `ETSU_POSTGRES_URL_OP_REF`
 3. existing `~/Library/Application Support/com.seatedro.etsu/config.toml`
-4. `~/Repositories/ledger/ops/ledger.env`
-5. `~/Third-party-repositories/ledger/ops/ledger.env`
+4. `ETSU_POSTGRES_URL_FILE`
+5. `~/Library/Application Support/com.seatedro.etsu/postgres_dsn.txt`
+6. `~/Library/Application Support/com.seatedro.etsu/postgres_url.txt`
+7. `~/Dropbox/Records/PersonalData/Etsu/postgres_dsn.txt`
+8. `~/Dropbox/Records/PersonalData/Etsu/postgres_url.txt`
+9. `~/Dropbox/Records/PersonalData/Etsu/supabase_dsn.txt`
 
 From the repo root:
 
@@ -120,8 +124,15 @@ Optional overrides:
 
 ```bash
 ETSU_POSTGRES_URL="postgresql://user:password@host:5432/postgres" ./setup_macos.sh
+ETSU_POSTGRES_URL_FILE="$HOME/Dropbox/Records/PersonalData/Etsu/postgres_dsn.txt" ./setup_macos.sh
 ETSU_POSTGRES_URL_OP_REF="op://Vault/Item/postgres_url" ./setup_macos.sh
 ETSU_BACKUP_DIR="$HOME/Dropbox/Records/PersonalData/Etsu/m2" ./setup_macos.sh
+```
+
+For a new Mac without an existing ETSU config, the simplest setup is to put the DSN on a single line in `~/Dropbox/Records/PersonalData/Etsu/postgres_dsn.txt` and then run:
+
+```bash
+../../setup_macos.sh
 ```
 
 ### Viewing Statistics

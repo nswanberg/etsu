@@ -13,10 +13,10 @@ LOCAL_DB_PATH="$APP_SUPPORT_DIR/etsu.db"
 BACKUP_ROOT="${ETSU_BACKUP_DIR:-$APP_SUPPORT_DIR/backups}"
 POSTGRES_URL="${ETSU_POSTGRES_URL:-}"
 POSTGRES_URL_OP_REF="${ETSU_POSTGRES_URL_OP_REF:-}"
+POSTGRES_URL_FILE="${ETSU_POSTGRES_URL_FILE:-}"
 DEVICE_ID="${ETSU_DEVICE_ID:-}"
 DEVICE_NAME="${ETSU_DEVICE_NAME:-}"
 SKIP_BUILD="${ETSU_SKIP_BUILD:-0}"
-LEDGER_ENV_PATH="${ETSU_LEDGER_ENV_PATH:-}"
 ETSU_BIN_PATH="$REPO_ROOT/target/release/etsu"
 BACKUP_DIR=""
 POSTGRES_URL_SOURCE="none"
@@ -27,34 +27,6 @@ note() {
 
 warn() {
   printf '%s\n' "$*" >&2
-}
-
-read_env_var_from_file() {
-  local file_path="$1"
-  local key="$2"
-
-  [[ -f "$file_path" ]] || return 1
-
-  python3 - "$file_path" "$key" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-key = sys.argv[2]
-
-for raw_line in path.read_text().splitlines():
-    line = raw_line.strip()
-    if not line or line.startswith("#") or "=" not in line:
-        continue
-    current_key, value = line.split("=", 1)
-    if current_key.strip() != key:
-        continue
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] == '"':
-        value = value[1:-1]
-    print(value)
-    break
-PY
 }
 
 read_existing_postgres_url() {
@@ -70,6 +42,24 @@ data = tomllib.loads(path.read_text())
 value = data.get("database", {}).get("postgres_url", "")
 if value:
     print(value)
+PY
+}
+
+read_first_line_from_file() {
+  local file_path="$1"
+
+  [[ -f "$file_path" ]] || return 1
+
+  python3 - "$file_path" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+for raw_line in path.read_text().splitlines():
+    line = raw_line.strip()
+    if line and not line.startswith("#"):
+        print(line)
+        break
 PY
 }
 
@@ -160,19 +150,26 @@ resolve_postgres_url() {
     return
   fi
 
-  local candidate_paths=()
-  if [[ -n "$LEDGER_ENV_PATH" ]]; then
-    candidate_paths+=("$LEDGER_ENV_PATH")
+  if [[ -n "$POSTGRES_URL_FILE" ]]; then
+    POSTGRES_URL="$(read_first_line_from_file "$POSTGRES_URL_FILE" || true)"
+    if [[ -n "$POSTGRES_URL" ]]; then
+      POSTGRES_URL_SOURCE="$POSTGRES_URL_FILE"
+      return
+    fi
   fi
-  candidate_paths+=(
-    "$HOME/Repositories/ledger/ops/ledger.env"
-    "$HOME/Third-party-repositories/ledger/ops/ledger.env"
+
+  local candidate_paths=(
+    "$HOME/Library/Application Support/com.seatedro.etsu/postgres_dsn.txt"
+    "$HOME/Library/Application Support/com.seatedro.etsu/postgres_url.txt"
+    "$HOME/Dropbox/Records/PersonalData/Etsu/postgres_dsn.txt"
+    "$HOME/Dropbox/Records/PersonalData/Etsu/postgres_url.txt"
+    "$HOME/Dropbox/Records/PersonalData/Etsu/supabase_dsn.txt"
   )
 
   local candidate_path
   for candidate_path in "${candidate_paths[@]}"; do
     [[ -n "$candidate_path" ]] || continue
-    POSTGRES_URL="$(read_env_var_from_file "$candidate_path" "LEDGER_ETSU_SUPABASE_DSN" || true)"
+    POSTGRES_URL="$(read_first_line_from_file "$candidate_path" || true)"
     if [[ -n "$POSTGRES_URL" ]]; then
       POSTGRES_URL_SOURCE="$candidate_path"
       return
@@ -321,6 +318,12 @@ resolve_postgres_url
 
 if [[ -n "$POSTGRES_URL" ]]; then
   upsert_key "database" "postgres_url" "$POSTGRES_URL"
+else
+  warn "No Postgres DSN found."
+  warn "Set ETSU_POSTGRES_URL, ETSU_POSTGRES_URL_FILE, ETSU_POSTGRES_URL_OP_REF, or place the DSN in one of:"
+  warn "  $HOME/Library/Application Support/com.seatedro.etsu/postgres_dsn.txt"
+  warn "  $HOME/Dropbox/Records/PersonalData/Etsu/postgres_dsn.txt"
+  exit 1
 fi
 
 if [[ -n "$DEVICE_ID" ]]; then
