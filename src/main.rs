@@ -59,6 +59,10 @@ async fn main() -> Result<()> {
         "Using device identity: {} ({})",
         identity.device_name, identity.device_id
     );
+    let executable_path = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let input_capture_permissions = platform::log_input_capture_permissions(&executable_path);
 
     if let Err(e) = platform::initialize_monitor_info() {
         error!("Failed to initialize monitor info using GLFW: {}. Distance calculation might be inaccurate or use defaults.", e);
@@ -111,13 +115,15 @@ async fn main() -> Result<()> {
 
     let metrics_state_clone = Arc::clone(&metrics_state);
     let capture_warning_after = Duration::from_secs(30);
-    let executable_path = std::env::current_exe()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| "<unknown>".to_string());
     let mut shutdown_rx_capture = shutdown_tx.subscribe();
     let capture_health_handle = tokio::spawn(async move {
         tokio::select! {
-            res = monitor_input_capture(metrics_state_clone, capture_warning_after, executable_path) => res,
+            res = monitor_input_capture(
+                metrics_state_clone,
+                capture_warning_after,
+                executable_path,
+                input_capture_permissions,
+            ) => res,
             _ = shutdown_rx_capture.recv() => {
                 debug!("Capture health task received shutdown signal");
                 Ok(())
@@ -237,6 +243,7 @@ async fn monitor_input_capture(
     state: Arc<MetricsState>,
     warning_after: Duration,
     executable_path: String,
+    input_capture_permissions: platform::InputCapturePermissions,
 ) -> Result<()> {
     let start = std::time::Instant::now();
     let mut interval = time::interval(Duration::from_secs(15));
@@ -249,12 +256,22 @@ async fn monitor_input_capture(
         let events_seen = state.input_events_seen.load(Ordering::Relaxed);
         if events_seen == 0 && start.elapsed() >= warning_after {
             if !startup_warning_emitted {
-                warn!(
-                    "ETSU is running but has not observed any keyboard or mouse events in the first {} seconds. \
+                if input_capture_permissions.missing_input_monitoring()
+                    || input_capture_permissions.missing_accessibility()
+                {
+                    warn!(
+                        "ETSU is running but input capture permissions are incomplete for {}. \
+Check System Settings > Privacy & Security and enable Input Monitoring and Accessibility for this exact binary path.",
+                        executable_path
+                    );
+                } else {
+                    warn!(
+                        "ETSU is running but has not observed any keyboard or mouse events in the first {} seconds. \
 This usually means macOS is blocking input capture for {}. Check Input Monitoring / Accessibility permissions for the ETSU binary path.",
-                    warning_after.as_secs(),
-                    executable_path
-                );
+                        warning_after.as_secs(),
+                        executable_path
+                    );
+                }
                 startup_warning_emitted = true;
             }
             continue;

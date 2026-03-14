@@ -279,6 +279,8 @@ print_startup_status() {
   local log_path
   local startup_lines
   local _attempt
+  local remote_status="unknown"
+  local capture_status="unknown"
 
   for _attempt in 1 2 3 4 5; do
     log_path="$(latest_log_path)"
@@ -287,30 +289,61 @@ print_startup_status() {
       startup_lines="$(tail -n 120 "$log_path")"
 
       if grep -Fq "Remote Postgres pool created." <<< "$startup_lines"; then
-        note "Remote sync: connected"
-        return
+        remote_status="connected"
+      elif grep -Fq "No remote Postgres URL configured." <<< "$startup_lines"; then
+        remote_status="disabled"
+      elif grep -Fq "Failed to connect to remote Postgres DB:" <<< "$startup_lines"; then
+        remote_status="failed"
       fi
 
-      if grep -Fq "No remote Postgres URL configured." <<< "$startup_lines"; then
-        note "Remote sync: disabled (no postgres_url configured)"
-        return
-      fi
-
-      if grep -Fq "Failed to connect to remote Postgres DB:" <<< "$startup_lines"; then
-        warn "Remote sync: connection failed"
-        grep -F "Failed to connect to remote Postgres DB:" <<< "$startup_lines" | tail -n 1 >&2
-        return
+      if grep -Fq "Input Monitoring permission is not granted" <<< "$startup_lines"; then
+        capture_status="input_monitoring_missing"
+      elif grep -Fq "Accessibility permission is not granted" <<< "$startup_lines"; then
+        capture_status="accessibility_missing"
+      elif grep -Fq "Input capture confirmed: first keyboard or mouse event received." <<< "$startup_lines"; then
+        capture_status="confirmed"
       fi
     fi
 
     sleep 1
   done
 
-  if [[ -f "$log_path" ]]; then
-    note "Remote sync: check $log_path"
-  else
-    warn "No ETSU log file found yet at $log_path"
-  fi
+  case "$remote_status" in
+    connected)
+      note "Remote sync: connected"
+      ;;
+    disabled)
+      note "Remote sync: disabled (no postgres_url configured)"
+      ;;
+    failed)
+      warn "Remote sync: connection failed"
+      grep -F "Failed to connect to remote Postgres DB:" <<< "$startup_lines" | tail -n 1 >&2
+      ;;
+    *)
+      if [[ -f "$log_path" ]]; then
+        note "Remote sync: check $log_path"
+      else
+        warn "No ETSU log file found yet at $log_path"
+      fi
+      ;;
+  esac
+
+  case "$capture_status" in
+    input_monitoring_missing)
+      warn "Input capture: Input Monitoring permission missing for the ETSU binary"
+      ;;
+    accessibility_missing)
+      warn "Input capture: Accessibility permission missing for the ETSU binary"
+      ;;
+    confirmed)
+      note "Input capture: confirmed"
+      ;;
+    *)
+      if [[ -f "$log_path" ]]; then
+        note "Input capture: check $log_path"
+      fi
+      ;;
+  esac
 }
 
 print_next_steps() {

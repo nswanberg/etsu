@@ -21,6 +21,22 @@ pub struct MonitorInfo {
 
 static MONITOR_INFO_CACHE: Lazy<Mutex<Option<Vec<MonitorInfo>>>> = Lazy::new(|| Mutex::new(None));
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InputCapturePermissions {
+    pub accessibility_granted: Option<bool>,
+    pub input_monitoring_granted: Option<bool>,
+}
+
+impl InputCapturePermissions {
+    pub fn missing_accessibility(self) -> bool {
+        matches!(self.accessibility_granted, Some(false))
+    }
+
+    pub fn missing_input_monitoring(self) -> bool {
+        matches!(self.input_monitoring_granted, Some(false))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PlatformError {
     #[error("GLFW initialization failed: {0:?}")]
@@ -31,6 +47,52 @@ pub enum PlatformError {
     CacheInit,
     #[error("No monitors available")]
     MonitorNotFound,
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrusted() -> bool;
+    fn CGPreflightListenEventAccess() -> bool;
+}
+
+pub fn detect_input_capture_permissions() -> InputCapturePermissions {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        return InputCapturePermissions {
+            accessibility_granted: Some(AXIsProcessTrusted()),
+            input_monitoring_granted: Some(CGPreflightListenEventAccess()),
+        };
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        InputCapturePermissions::default()
+    }
+}
+
+pub fn log_input_capture_permissions(executable_path: &str) -> InputCapturePermissions {
+    let permissions = detect_input_capture_permissions();
+
+    match permissions.input_monitoring_granted {
+        Some(true) => info!("Input Monitoring permission is granted for {}.", executable_path),
+        Some(false) => warn!(
+            "Input Monitoring permission is not granted for {}. Enable System Settings > Privacy & Security > Input Monitoring.",
+            executable_path
+        ),
+        None => {}
+    }
+
+    match permissions.accessibility_granted {
+        Some(true) => info!("Accessibility permission is granted for {}.", executable_path),
+        Some(false) => warn!(
+            "Accessibility permission is not granted for {}. Enable System Settings > Privacy & Security > Accessibility.",
+            executable_path
+        ),
+        None => {}
+    }
+
+    permissions
 }
 
 /// Initializes GLFW, fetches monitor information, calculates PPI, caches it, and terminates GLFW.
