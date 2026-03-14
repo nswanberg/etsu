@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
 use tokio::time;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 #[instrument(skip(rx, state, processing_interval))]
 pub async fn aggregate_metrics(
@@ -29,7 +29,12 @@ pub async fn aggregate_metrics(
         tokio::select! {
             biased;
             Some(event) = rx.recv() => {
-                 match event {
+                let first_input_event = state.record_input_event();
+                if first_input_event {
+                    info!("Input capture confirmed: first keyboard or mouse event received.");
+                }
+
+                match event {
                     InputEvent::KeyPress => {
                         state.interval.keypresses.fetch_add(1, Ordering::Relaxed);
                     }

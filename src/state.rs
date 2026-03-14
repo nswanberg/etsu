@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Default)]
@@ -55,4 +56,21 @@ pub struct MetricsState {
     pub latest_mouse_y: AtomicI32,
     pub last_calc_mouse_x: AtomicI32,
     pub last_calc_mouse_y: AtomicI32,
+    pub input_events_seen: AtomicU64,
+    pub last_input_event_unix_secs: AtomicU64,
+}
+
+impl MetricsState {
+    /// Records that a low-level input event was received.
+    /// Returns true when this is the first observed event since startup.
+    pub fn record_input_event(&self) -> bool {
+        let previous = self.input_events_seen.fetch_add(1, Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.last_input_event_unix_secs
+            .store(now, Ordering::Relaxed);
+        previous == 0
+    }
 }

@@ -14,8 +14,11 @@ use crate::error::Result;
 use directories::ProjectDirs;
 use error::AppError;
 use state::MetricsState;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
+use tokio::time;
 use tracing::{debug, error, info, warn};
 use tracing_appender::rolling;
 use tracing_subscriber::EnvFilter;
@@ -107,6 +110,22 @@ async fn main() -> Result<()> {
     });
 
     let metrics_state_clone = Arc::clone(&metrics_state);
+    let capture_warning_after = Duration::from_secs(30);
+    let executable_path = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let mut shutdown_rx_capture = shutdown_tx.subscribe();
+    let capture_health_handle = tokio::spawn(async move {
+        tokio::select! {
+            res = monitor_input_capture(metrics_state_clone, capture_warning_after, executable_path) => res,
+            _ = shutdown_rx_capture.recv() => {
+                debug!("Capture health task received shutdown signal");
+                Ok(())
+            }
+        }
+    });
+
+    let metrics_state_clone = Arc::clone(&metrics_state);
     let saving_interval = settings.saving_interval();
     let sqlite_pool_clone = sqlite_pool.clone();
     let pg_pool_option_clone = pg_pool_option.clone();
@@ -149,8 +168,11 @@ async fn main() -> Result<()> {
     let processing_timeout = tokio::time::timeout(timeout, processing_handle);
     let persistence_timeout = tokio::time::timeout(timeout, persistence_handle);
 
-    let (processing_result, persistence_result) =
-        tokio::join!(processing_timeout, persistence_timeout);
+    let (processing_result, persistence_result, capture_health_result) = tokio::join!(
+        processing_timeout,
+        persistence_timeout,
+        tokio::time::timeout(timeout, capture_health_handle)
+    );
 
     if processing_result.is_err() {
         warn!("Processing task did not complete within timeout, aborting");
@@ -158,6 +180,10 @@ async fn main() -> Result<()> {
 
     if persistence_result.is_err() {
         warn!("Persistence task did not complete within timeout, aborting");
+    }
+
+    if capture_health_result.is_err() {
+        warn!("Capture health task did not complete within timeout, aborting");
     }
 
     info!("Closing database pools...");
@@ -203,6 +229,69 @@ async fn handle_signals(mut signals: Signals, shutdown_tx: broadcast::Sender<()>
                 break;
             }
             _ => warn!("Received unexpected signal: {}", signal),
+        }
+    }
+}
+
+async fn monitor_input_capture(
+    state: Arc<MetricsState>,
+    warning_after: Duration,
+    executable_path: String,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    let mut interval = time::interval(Duration::from_secs(15));
+    let mut startup_warning_emitted = false;
+    let mut stalled_warning_emitted = false;
+
+    loop {
+        interval.tick().await;
+
+        let events_seen = state.input_events_seen.load(Ordering::Relaxed);
+        if events_seen == 0 && start.elapsed() >= warning_after {
+            if !startup_warning_emitted {
+                warn!(
+                    "ETSU is running but has not observed any keyboard or mouse events in the first {} seconds. \
+This usually means macOS is blocking input capture for {}. Check Input Monitoring / Accessibility permissions for the ETSU binary path.",
+                    warning_after.as_secs(),
+                    executable_path
+                );
+                startup_warning_emitted = true;
+            }
+            continue;
+        }
+
+        if events_seen == 0 {
+            continue;
+        }
+
+        if startup_warning_emitted {
+            info!("Input capture resumed after startup warning.");
+            startup_warning_emitted = false;
+        }
+
+        let last_input_event_unix_secs = state.last_input_event_unix_secs.load(Ordering::Relaxed);
+        if last_input_event_unix_secs == 0 {
+            continue;
+        }
+
+        let now_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let idle_secs = now_unix_secs.saturating_sub(last_input_event_unix_secs);
+        if idle_secs >= 300 {
+            if !stalled_warning_emitted {
+                warn!(
+                    "ETSU has been running but has not seen an input event for {} minutes. \
+If this Mac is in active use, check Input Monitoring / Accessibility permissions for {}.",
+                    idle_secs / 60,
+                    executable_path
+                );
+                stalled_warning_emitted = true;
+            }
+        } else if stalled_warning_emitted {
+            info!("Input capture resumed after an idle warning.");
+            stalled_warning_emitted = false;
         }
     }
 }
