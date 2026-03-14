@@ -35,13 +35,31 @@ read_existing_postgres_url() {
   python3 - "$CONFIG_PATH" <<'PY'
 from pathlib import Path
 import sys
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import importlib
+    tomllib = None
 
 path = Path(sys.argv[1])
-data = tomllib.loads(path.read_text())
-value = data.get("database", {}).get("postgres_url", "")
-if value:
-    print(value)
+text = path.read_text()
+
+if tomllib is not None:
+    data = tomllib.loads(text)
+    value = data.get("database", {}).get("postgres_url", "")
+    if value:
+        print(value)
+else:
+    # Fallback for Python < 3.11: simple line-based parse
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("postgres_url"):
+            _, _, val = stripped.partition("=")
+            val = val.strip().strip('"')
+            if val:
+                print(val)
+            break
 PY
 }
 

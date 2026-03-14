@@ -1,5 +1,6 @@
 use crate::config::{DeviceIdentity, RemoteDatabaseSettings};
 use crate::error::Result;
+use postgrest::Postgrest;
 use sea_query::{Alias, Expr, Iden, PostgresQueryBuilder, Query, SqliteQueryBuilder};
 use sea_query_binder::SqlxBinder;
 use sqlx::{migrate::Migrator, PgPool, Pool, Postgres, Sqlite, SqlitePool, Transaction};
@@ -437,4 +438,139 @@ pub async fn persist_metrics_transactional_postgres(
             Err(e)
         }
     }
+}
+
+// --- Supabase REST API sync ---
+
+const SUPABASE_BATCH_SIZE: u32 = 100;
+
+#[derive(Clone)]
+pub struct SupabaseClient {
+    client: Postgrest,
+}
+
+pub async fn setup_supabase_client(
+    settings: &RemoteDatabaseSettings,
+) -> Option<SupabaseClient> {
+    let url = settings.supabase_url.as_deref().filter(|s| !s.is_empty())?;
+    let api_key = settings.supabase_api_key.as_deref().filter(|s| !s.is_empty())?;
+
+    let rest_url = format!("{}/rest/v1", url.trim_end_matches('/'));
+    let client = Postgrest::new(&rest_url)
+        .insert_header("apikey", api_key);
+
+    // Verify connectivity
+    let resp = client
+        .from("metrics")
+        .select("id")
+        .limit(0)
+        .execute()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            info!("Supabase REST API connected at {}", url);
+        }
+        Ok(r) => {
+            warn!(
+                "Supabase REST API returned HTTP {}: check API key and table permissions. Remote sync will be disabled.",
+                r.status()
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!(
+                "Failed to reach Supabase REST API at {}: {}. Remote sync will be disabled.",
+                url, e
+            );
+            return None;
+        }
+    }
+
+    Some(SupabaseClient { client })
+}
+
+/// Sync all unsynced local SQLite rows to Supabase in batches. Returns the number of rows synced.
+pub async fn sync_to_supabase(
+    supabase: &SupabaseClient,
+    sqlite_pool: &Pool<Sqlite>,
+) -> Result<u64> {
+    let mut total_synced: u64 = 0;
+
+    loop {
+        let rows = sqlx::query_as::<_, (i64, i64, i64, i64, f64, f64, Option<String>, Option<String>, String)>(
+            r#"SELECT id, keypresses, mouse_clicks, scroll_steps, mouse_distance_in, mouse_distance_mi, device_id, device_name, timestamp
+               FROM metrics
+               WHERE supabase_synced_at IS NULL
+               ORDER BY id ASC
+               LIMIT ?"#,
+        )
+        .bind(SUPABASE_BATCH_SIZE)
+        .fetch_all(sqlite_pool)
+        .await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        let batch_len = rows.len() as u64;
+        let first_id = rows.first().map(|r| r.0).unwrap_or(0);
+        let last_id = rows.last().map(|r| r.0).unwrap_or(0);
+
+        let json_rows: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "keypresses": r.1,
+                    "mouse_clicks": r.2,
+                    "scroll_steps": r.3,
+                    "mouse_distance_in": r.4,
+                    "mouse_distance_mi": r.5,
+                    "device_id": r.6,
+                    "device_name": r.7,
+                    "timestamp": r.8,
+                })
+            })
+            .collect();
+
+        let body = serde_json::to_string(&json_rows).map_err(|e| {
+            crate::error::AppError::Initialization(format!("JSON serialization failed: {}", e))
+        })?;
+
+        let resp = supabase
+            .client
+            .from("metrics")
+            .insert(body)
+            .execute()
+            .await
+            .map_err(|e| {
+                crate::error::AppError::Initialization(format!("Supabase insert failed: {}", e))
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(crate::error::AppError::Initialization(format!(
+                "Supabase insert failed ({}): {}",
+                status, text
+            )));
+        }
+
+        // Mark batch as synced
+        sqlx::query(
+            "UPDATE metrics SET supabase_synced_at = CURRENT_TIMESTAMP WHERE id >= ? AND id <= ? AND supabase_synced_at IS NULL",
+        )
+        .bind(first_id)
+        .bind(last_id)
+        .execute(sqlite_pool)
+        .await?;
+
+        total_synced += batch_len;
+        info!(
+            "Supabase sync: {} rows (ids {}..{}), {} total",
+            batch_len, first_id, last_id, total_synced
+        );
+    }
+
+    Ok(total_synced)
 }

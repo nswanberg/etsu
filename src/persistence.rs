@@ -1,5 +1,5 @@
 use crate::config::DeviceIdentity;
-use crate::db::{self, MetricsData};
+use crate::db::{self, MetricsData, SupabaseClient};
 use crate::error::Result;
 use crate::state::MetricsState;
 use sqlx::{Pool, Postgres, Sqlite};
@@ -9,14 +9,18 @@ use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, instrument};
 
-#[instrument(skip(state, sqlite_pool, pg_pool_option, saving_interval))]
+#[instrument(skip(state, sqlite_pool, pg_pool_option, supabase_option, saving_interval))]
 pub async fn save_metrics_periodically(
     state: Arc<MetricsState>,
     sqlite_pool: Pool<Sqlite>,
     pg_pool_option: Option<Pool<Postgres>>,
+    supabase_option: Option<SupabaseClient>,
     identity: DeviceIdentity,
     saving_interval: Duration,
 ) -> Result<()> {
+    // Note: saving_interval is used for both metric persistence and Supabase sync.
+    // Supabase sync happens after each SQLite write, so new rows plus any previously
+    // unsynced rows are all picked up every interval.
     debug!(
         "Starting metrics persistence task with interval: {:?}",
         saving_interval
@@ -73,6 +77,13 @@ pub async fn save_metrics_periodically(
                 if let Err(e) = db::persist_metrics_postgres(pg_pool, &data_to_save, &identity).await {
                     error!("Failed to persist metrics to remote Postgres: {}", e);
                 }
+            }
+
+        }
+
+        if let Some(ref supabase) = supabase_option {
+            if let Err(e) = db::sync_to_supabase(supabase, &sqlite_pool).await {
+                error!("Failed to sync metrics to Supabase: {}", e);
             }
         }
     }

@@ -13,6 +13,8 @@ pub struct DeviceIdentity {
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct RemoteDatabaseSettings {
     pub postgres_url: Option<String>,
+    pub supabase_url: Option<String>,
+    pub supabase_api_key: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -63,7 +65,11 @@ impl Default for IntervalSettings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            database: RemoteDatabaseSettings { postgres_url: None },
+            database: RemoteDatabaseSettings {
+                postgres_url: None,
+                supabase_url: None,
+                supabase_api_key: None,
+            },
             identity: IdentitySettings::default(),
             intervals_ms: IntervalSettings {
                 processing: default_processing_interval(),
@@ -85,6 +91,8 @@ impl Settings {
 
         let builder = config::Config::builder()
             .set_default("database.postgres_url", None::<String>)?
+            .set_default("database.supabase_url", None::<String>)?
+            .set_default("database.supabase_api_key", None::<String>)?
             .set_default("identity.device_id", None::<String>)?
             .set_default("identity.device_name", None::<String>)?
             .set_default("intervals_ms.processing", default_processing_interval())?

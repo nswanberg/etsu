@@ -8,7 +8,7 @@ An elegant personal spyware. (JK, it tracks silly metrics)
 ## Features
 
 - Tracks keypresses, mouse clicks, scroll steps, and mouse distance traveled
-- Local SQLite storage with optional PostgreSQL syncing
+- Local SQLite storage with optional Supabase REST API syncing (and legacy PostgreSQL support)
 - Minimal resource usage
 - Simple configuration
 - Runs as a background service/daemon
@@ -38,16 +38,28 @@ cp config.example.toml config.toml
 
 Edit the `config.toml` file to adjust settings.
 
-Example Supabase-backed identity block:
+### Supabase sync (recommended)
 
 ```toml
 [database]
-postgres_url = "postgresql://user:password@host:5432/postgres"
+supabase_url = "https://your-project-ref.supabase.co"
+supabase_api_key = "sb_publishable_..."
 
 [identity]
 device_id = "device-your-machine"
 device_name = "Your Mac"
 ```
+
+ETSU syncs all local SQLite rows to Supabase via the REST API every save interval. Unsynced rows are tracked with a `supabase_synced_at` column, so historical data is backfilled automatically on first connect.
+
+### Legacy direct Postgres
+
+```toml
+[database]
+postgres_url = "postgresql://user:password@host:5432/postgres"
+```
+
+Note: Supabase's direct Postgres endpoint is IPv6-only, which may not work on all networks. The REST API (above) is IPv4 and works everywhere.
 
 If `identity.device_id` or `identity.device_name` is missing, ETSU will generate and persist them into the config file on first launch.
 
@@ -96,10 +108,10 @@ If you have an older local install using `com.nswanberg.etsu`, the installer wil
 
 Use the installer script. It stops any existing ETSU process, backs up the live config and SQLite database from the default macOS paths, reuses the current device identity, rebuilds, and installs the LaunchAgent.
 
-It resolves the Supabase/Postgres DSN from the first place that has one:
+It resolves the Postgres DSN (if used) from the first place that has one:
 
-1. `ETSU_POSTGRES_URL`
-2. `ETSU_POSTGRES_URL_OP_REF`
+1. `ETSU_POSTGRES_URL` environment variable
+2. `ETSU_POSTGRES_URL_OP_REF` (1Password CLI reference)
 3. existing `~/Library/Application Support/com.seatedro.etsu/config.toml`
 4. `ETSU_POSTGRES_URL_FILE`
 5. `~/Library/Application Support/com.seatedro.etsu/postgres_dsn.txt`
@@ -107,6 +119,8 @@ It resolves the Supabase/Postgres DSN from the first place that has one:
 7. `~/Dropbox/Records/PersonalData/Etsu/postgres_dsn.txt`
 8. `~/Dropbox/Records/PersonalData/Etsu/postgres_url.txt`
 9. `~/Dropbox/Records/PersonalData/Etsu/supabase_dsn.txt`
+
+For Supabase REST API sync, set `supabase_url` and `supabase_api_key` in your config directly.
 
 From the repo root:
 

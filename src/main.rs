@@ -67,6 +67,7 @@ async fn main() -> Result<()> {
         .to_string();
     let (sqlite_pool, pg_pool_option) =
         db::setup_database_pools(&local_db_path, &settings.database).await?;
+    let supabase_option = db::setup_supabase_client(&settings.database).await;
 
     if let Err(e) = db::run_migrations(&sqlite_pool, &pg_pool_option).await {
         error!(
@@ -109,6 +110,7 @@ async fn main() -> Result<()> {
     let saving_interval = settings.saving_interval();
     let sqlite_pool_clone = sqlite_pool.clone();
     let pg_pool_option_clone = pg_pool_option.clone();
+    let supabase_option_clone = supabase_option.clone();
     let identity_clone = identity.clone();
 
     let mut shutdown_rx2 = shutdown_tx.subscribe();
@@ -118,6 +120,7 @@ async fn main() -> Result<()> {
                 metrics_state_clone,
                 sqlite_pool_clone,
                 pg_pool_option_clone,
+                supabase_option_clone,
                 identity_clone,
                 saving_interval,
             ) => res,

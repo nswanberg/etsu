@@ -1,10 +1,12 @@
 # Example configuration for etsu
 
 [database]
-# Your postgres database url, if empty only local sqlite db will be used
-# Example:
+# Supabase REST API sync (recommended). Works on any network (IPv4).
+# supabase_url = "https://your-project-ref.supabase.co"
+# supabase_api_key = "sb_publishable_..."
+
+# Legacy direct Postgres connection. Supabase's direct endpoint is IPv6-only.
 # postgres_url = "postgresql://user:password@host:port/postgres"
-postgres_url = ""
 
 [identity]
 # Stable per-device identifier and display name.
