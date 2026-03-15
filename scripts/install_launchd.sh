@@ -9,7 +9,8 @@ PRIMARY_LABEL="com.seatedro.etsu"
 LEGACY_LABEL="com.nswanberg.etsu"
 PLIST_PATH="$LAUNCH_AGENTS_DIR/$PRIMARY_LABEL.plist"
 LEGACY_PLIST_PATH="$LAUNCH_AGENTS_DIR/$LEGACY_LABEL.plist"
-ETSU_BIN_PATH="${ETSU_BIN_PATH:-$REPO_ROOT/target/release/etsu}"
+ETSU_APP_BUNDLE_PATH="${ETSU_APP_BUNDLE_PATH:-$HOME/Applications/Etsu.app}"
+ETSU_BIN_PATH="${ETSU_BIN_PATH:-$ETSU_APP_BUNDLE_PATH/Contents/MacOS/etsu}"
 LOG_DIR="$HOME/Library/Logs"
 APP_SUPPORT_DIR="$HOME/Library/Application Support/com.seatedro.etsu"
 CONFIG_PATH="$APP_SUPPORT_DIR/config.toml"
@@ -17,7 +18,7 @@ DB_PATH="$APP_SUPPORT_DIR/etsu.db"
 
 if [[ ! -x "$ETSU_BIN_PATH" ]]; then
   echo "Missing ETSU binary at $ETSU_BIN_PATH" >&2
-  echo "Build it first with: cargo build --release" >&2
+  echo "Install it first with: ./setup_macos.sh" >&2
   exit 1
 fi
 
@@ -108,6 +109,7 @@ launchctl enable "gui/$(id -u)/$PRIMARY_LABEL"
 launchctl kickstart -k "gui/$(id -u)/$PRIMARY_LABEL"
 
 echo "Installed $PRIMARY_LABEL"
+echo "App bundle: $ETSU_APP_BUNDLE_PATH"
 echo "Config file: $CONFIG_PATH"
 echo "Local SQLite DB: $DB_PATH"
 echo "LaunchAgent: $PLIST_PATH"

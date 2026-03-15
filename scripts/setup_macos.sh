@@ -14,12 +14,21 @@ BACKUP_ROOT="${ETSU_BACKUP_DIR:-$APP_SUPPORT_DIR/backups}"
 POSTGRES_URL="${ETSU_POSTGRES_URL:-}"
 POSTGRES_URL_OP_REF="${ETSU_POSTGRES_URL_OP_REF:-}"
 POSTGRES_URL_FILE="${ETSU_POSTGRES_URL_FILE:-}"
+SUPABASE_URL="${ETSU_SUPABASE_URL:-}"
+SUPABASE_URL_FILE="${ETSU_SUPABASE_URL_FILE:-}"
+SUPABASE_API_KEY="${ETSU_SUPABASE_API_KEY:-}"
+SUPABASE_API_KEY_FILE="${ETSU_SUPABASE_API_KEY_FILE:-}"
 DEVICE_ID="${ETSU_DEVICE_ID:-}"
 DEVICE_NAME="${ETSU_DEVICE_NAME:-}"
 SKIP_BUILD="${ETSU_SKIP_BUILD:-0}"
-ETSU_BIN_PATH="$REPO_ROOT/target/release/etsu"
+APP_BUNDLE_PATH="${ETSU_APP_BUNDLE_PATH:-$HOME/Applications/Etsu.app}"
+BUILD_BIN_PATH="$REPO_ROOT/target/release/etsu"
+INSTALLED_BIN_PATH="$APP_BUNDLE_PATH/Contents/MacOS/etsu"
 BACKUP_DIR=""
 POSTGRES_URL_SOURCE="none"
+SUPABASE_URL_SOURCE="none"
+SUPABASE_API_KEY_SOURCE="none"
+REMOTE_MODE="none"
 
 note() {
   printf '%s\n' "$*"
@@ -29,10 +38,12 @@ warn() {
   printf '%s\n' "$*" >&2
 }
 
-read_existing_postgres_url() {
+read_existing_database_value() {
+  local key_name="$1"
+
   [[ -f "$CONFIG_PATH" ]] || return 1
 
-  python3 - "$CONFIG_PATH" <<'PY'
+  python3 - "$CONFIG_PATH" "$key_name" <<'PY'
 from pathlib import Path
 import sys
 
@@ -43,18 +54,19 @@ except ModuleNotFoundError:
     tomllib = None
 
 path = Path(sys.argv[1])
+key_name = sys.argv[2]
 text = path.read_text()
 
 if tomllib is not None:
     data = tomllib.loads(text)
-    value = data.get("database", {}).get("postgres_url", "")
+    value = data.get("database", {}).get(key_name, "")
     if value:
         print(value)
 else:
     # Fallback for Python < 3.11: simple line-based parse
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped.startswith("postgres_url"):
+        if stripped.startswith(key_name):
             _, _, val = stripped.partition("=")
             val = val.strip().strip('"')
             if val:
@@ -146,6 +158,14 @@ upsert_key() {
   fi
 }
 
+delete_key() {
+  local key="$1"
+
+  KEY="$key" perl -0pi -e '
+    s/^[ \t]*(?:#\s*)?\Q$ENV{KEY}\E\s*=.*\n?//gme
+  ' "$CONFIG_PATH"
+}
+
 resolve_postgres_url() {
   if [[ -n "$POSTGRES_URL" ]]; then
     POSTGRES_URL_SOURCE="ETSU_POSTGRES_URL"
@@ -162,7 +182,7 @@ resolve_postgres_url() {
     return
   fi
 
-  POSTGRES_URL="$(read_existing_postgres_url || true)"
+  POSTGRES_URL="$(read_existing_database_value postgres_url || true)"
   if [[ -n "$POSTGRES_URL" ]]; then
     POSTGRES_URL_SOURCE="$CONFIG_PATH"
     return
@@ -195,6 +215,100 @@ resolve_postgres_url() {
   done
 }
 
+resolve_supabase_url() {
+  if [[ -n "$SUPABASE_URL" ]]; then
+    SUPABASE_URL_SOURCE="ETSU_SUPABASE_URL"
+    return
+  fi
+
+  SUPABASE_URL="$(read_existing_database_value supabase_url || true)"
+  if [[ -n "$SUPABASE_URL" ]]; then
+    SUPABASE_URL_SOURCE="$CONFIG_PATH"
+    return
+  fi
+
+  if [[ -n "$SUPABASE_URL_FILE" ]]; then
+    SUPABASE_URL="$(read_first_line_from_file "$SUPABASE_URL_FILE" || true)"
+    if [[ -n "$SUPABASE_URL" ]]; then
+      SUPABASE_URL_SOURCE="$SUPABASE_URL_FILE"
+      return
+    fi
+  fi
+
+  local candidate_paths=(
+    "$HOME/Library/Application Support/com.seatedro.etsu/supabase_url.txt"
+    "$HOME/Dropbox/Records/PersonalData/Etsu/supabase_url.txt"
+  )
+
+  local candidate_path
+  for candidate_path in "${candidate_paths[@]}"; do
+    SUPABASE_URL="$(read_first_line_from_file "$candidate_path" || true)"
+    if [[ -n "$SUPABASE_URL" ]]; then
+      SUPABASE_URL_SOURCE="$candidate_path"
+      return
+    fi
+  done
+}
+
+resolve_supabase_api_key() {
+  if [[ -n "$SUPABASE_API_KEY" ]]; then
+    SUPABASE_API_KEY_SOURCE="ETSU_SUPABASE_API_KEY"
+    return
+  fi
+
+  SUPABASE_API_KEY="$(read_existing_database_value supabase_api_key || true)"
+  if [[ -n "$SUPABASE_API_KEY" ]]; then
+    SUPABASE_API_KEY_SOURCE="$CONFIG_PATH"
+    return
+  fi
+
+  if [[ -n "$SUPABASE_API_KEY_FILE" ]]; then
+    SUPABASE_API_KEY="$(read_first_line_from_file "$SUPABASE_API_KEY_FILE" || true)"
+    if [[ -n "$SUPABASE_API_KEY" ]]; then
+      SUPABASE_API_KEY_SOURCE="$SUPABASE_API_KEY_FILE"
+      return
+    fi
+  fi
+
+  local candidate_paths=(
+    "$HOME/Library/Application Support/com.seatedro.etsu/supabase_api_key.txt"
+    "$HOME/Library/Application Support/com.seatedro.etsu/supabase_publishable_key.txt"
+    "$HOME/Dropbox/Records/PersonalData/Etsu/supabase_api_key.txt"
+    "$HOME/Dropbox/Records/PersonalData/Etsu/supabase_publishable_key.txt"
+  )
+
+  local candidate_path
+  for candidate_path in "${candidate_paths[@]}"; do
+    SUPABASE_API_KEY="$(read_first_line_from_file "$candidate_path" || true)"
+    if [[ -n "$SUPABASE_API_KEY" ]]; then
+      SUPABASE_API_KEY_SOURCE="$candidate_path"
+      return
+    fi
+  done
+}
+
+resolve_remote_config() {
+  resolve_supabase_url
+  resolve_supabase_api_key
+
+  if [[ -n "$SUPABASE_URL" || -n "$SUPABASE_API_KEY" ]]; then
+    if [[ -z "$SUPABASE_URL" || -z "$SUPABASE_API_KEY" ]]; then
+      warn "Supabase REST sync was partially configured."
+      warn "Both supabase_url and supabase_api_key are required."
+      exit 1
+    fi
+
+    REMOTE_MODE="supabase"
+    return
+  fi
+
+  resolve_postgres_url
+  if [[ -n "$POSTGRES_URL" ]]; then
+    REMOTE_MODE="postgres"
+    return
+  fi
+}
+
 stop_agent() {
   local label="$1"
   local plist_path="$HOME/Library/LaunchAgents/$label.plist"
@@ -206,28 +320,32 @@ stop_agent() {
 }
 
 stop_manual_processes() {
+  local candidate_path
   local pids
-  pids="$(pgrep -f "$ETSU_BIN_PATH" || true)"
 
-  if [[ -z "$pids" ]]; then
-    return
-  fi
+  for candidate_path in "$BUILD_BIN_PATH" "$INSTALLED_BIN_PATH"; do
+    pids="$(pgrep -f "$candidate_path" || true)"
 
-  note "Stopping existing ETSU process(es) for $ETSU_BIN_PATH"
-  while IFS= read -r pid; do
-    [[ -n "$pid" ]] || continue
-    kill "$pid" 2>/dev/null || true
-  done <<< "$pids"
+    if [[ -z "$pids" ]]; then
+      continue
+    fi
 
-  sleep 1
-
-  pids="$(pgrep -f "$ETSU_BIN_PATH" || true)"
-  if [[ -n "$pids" ]]; then
+    note "Stopping existing ETSU process(es) for $candidate_path"
     while IFS= read -r pid; do
       [[ -n "$pid" ]] || continue
-      kill -9 "$pid" 2>/dev/null || true
+      kill "$pid" 2>/dev/null || true
     done <<< "$pids"
-  fi
+
+    sleep 1
+
+    pids="$(pgrep -f "$candidate_path" || true)"
+    if [[ -n "$pids" ]]; then
+      while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        kill -9 "$pid" 2>/dev/null || true
+      done <<< "$pids"
+    fi
+  done
 }
 
 stop_existing_etsu() {
@@ -271,6 +389,12 @@ run_build() {
   cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml"
 }
 
+install_app_bundle() {
+  ETSU_BUILD_BIN_PATH="$BUILD_BIN_PATH" \
+    ETSU_APP_BUNDLE_PATH="$APP_BUNDLE_PATH" \
+    "$SCRIPT_DIR/install_app_bundle.sh"
+}
+
 latest_log_path() {
   find "$APP_SUPPORT_DIR" -maxdepth 1 -type f -name 'etsu.log.*' -print | sort | tail -n 1
 }
@@ -288,12 +412,18 @@ print_startup_status() {
     if [[ -f "$log_path" ]]; then
       startup_lines="$(tail -n 120 "$log_path")"
 
-      if grep -Fq "Remote Postgres pool created." <<< "$startup_lines"; then
+      if grep -Fq "Supabase REST API connected at" <<< "$startup_lines"; then
         remote_status="connected"
-      elif grep -Fq "No remote Postgres URL configured." <<< "$startup_lines"; then
-        remote_status="disabled"
+      elif grep -Fq "Remote Postgres pool created." <<< "$startup_lines"; then
+        remote_status="connected"
       elif grep -Fq "Failed to connect to remote Postgres DB:" <<< "$startup_lines"; then
         remote_status="failed"
+      elif grep -Fq "Supabase REST API returned HTTP" <<< "$startup_lines"; then
+        remote_status="failed"
+      elif grep -Fq "Failed to reach Supabase REST API at" <<< "$startup_lines"; then
+        remote_status="failed"
+      elif grep -Fq "No remote Postgres URL configured." <<< "$startup_lines"; then
+        remote_status="disabled"
       fi
 
       if grep -Fq "Input Monitoring permission is not granted" <<< "$startup_lines"; then
@@ -313,11 +443,15 @@ print_startup_status() {
       note "Remote sync: connected"
       ;;
     disabled)
-      note "Remote sync: disabled (no postgres_url configured)"
+      if [[ "$REMOTE_MODE" == "none" ]]; then
+        note "Remote sync: disabled"
+      else
+        note "Remote sync: check $log_path"
+      fi
       ;;
     failed)
       warn "Remote sync: connection failed"
-      grep -F "Failed to connect to remote Postgres DB:" <<< "$startup_lines" | tail -n 1 >&2
+      grep -E "Failed to connect to remote Postgres DB:|Supabase REST API returned HTTP|Failed to reach Supabase REST API at" <<< "$startup_lines" | tail -n 1 >&2
       ;;
     *)
       if [[ -f "$log_path" ]]; then
@@ -352,6 +486,8 @@ ETSU macOS setup complete.
 Config file: $CONFIG_PATH
 Local SQLite DB: $LOCAL_DB_PATH
 Backup directory: $BACKUP_DIR
+Installed app bundle: $APP_BUNDLE_PATH
+Installed binary: $INSTALLED_BIN_PATH
 
 Verify the agent:
   launchctl print "gui/$(id -u)/com.seatedro.etsu"
@@ -365,17 +501,32 @@ EOF
 stop_existing_etsu
 backup_existing_state
 ensure_config_file
-resolve_postgres_url
+resolve_remote_config
 
-if [[ -n "$POSTGRES_URL" ]]; then
-  upsert_key "database" "postgres_url" "$POSTGRES_URL"
-else
-  warn "No Postgres DSN found."
-  warn "Set ETSU_POSTGRES_URL, ETSU_POSTGRES_URL_FILE, ETSU_POSTGRES_URL_OP_REF, or place the DSN in one of:"
-  warn "  $HOME/Library/Application Support/com.seatedro.etsu/postgres_dsn.txt"
-  warn "  $HOME/Dropbox/Records/PersonalData/Etsu/postgres_dsn.txt"
-  exit 1
-fi
+case "$REMOTE_MODE" in
+  supabase)
+    upsert_key "database" "supabase_url" "$SUPABASE_URL"
+    upsert_key "database" "supabase_api_key" "$SUPABASE_API_KEY"
+    delete_key "postgres_url"
+    ;;
+  postgres)
+    upsert_key "database" "postgres_url" "$POSTGRES_URL"
+    delete_key "supabase_url"
+    delete_key "supabase_api_key"
+    ;;
+  *)
+    warn "No remote sync configuration found."
+    warn "Supabase REST: set ETSU_SUPABASE_URL and ETSU_SUPABASE_API_KEY, or place them in:"
+    warn "  $HOME/Library/Application Support/com.seatedro.etsu/supabase_url.txt"
+    warn "  $HOME/Library/Application Support/com.seatedro.etsu/supabase_api_key.txt"
+    warn "  $HOME/Dropbox/Records/PersonalData/Etsu/supabase_url.txt"
+    warn "  $HOME/Dropbox/Records/PersonalData/Etsu/supabase_api_key.txt"
+    warn "Legacy Postgres: set ETSU_POSTGRES_URL, ETSU_POSTGRES_URL_FILE, ETSU_POSTGRES_URL_OP_REF, or place the DSN in:"
+    warn "  $HOME/Library/Application Support/com.seatedro.etsu/postgres_dsn.txt"
+    warn "  $HOME/Dropbox/Records/PersonalData/Etsu/postgres_dsn.txt"
+    exit 1
+    ;;
+esac
 
 if [[ -n "$DEVICE_ID" ]]; then
   upsert_key "identity" "device_id" "$DEVICE_ID"
@@ -386,7 +537,20 @@ if [[ -n "$DEVICE_NAME" ]]; then
 fi
 
 run_build
-"$SCRIPT_DIR/install_launchd.sh"
-note "Postgres DSN source: $POSTGRES_URL_SOURCE"
+install_app_bundle
+ETSU_APP_BUNDLE_PATH="$APP_BUNDLE_PATH" \
+  ETSU_BIN_PATH="$INSTALLED_BIN_PATH" \
+  "$SCRIPT_DIR/install_launchd.sh"
+
+case "$REMOTE_MODE" in
+  supabase)
+    note "Supabase URL source: $SUPABASE_URL_SOURCE"
+    note "Supabase API key source: $SUPABASE_API_KEY_SOURCE"
+    ;;
+  postgres)
+    note "Postgres DSN source: $POSTGRES_URL_SOURCE"
+    ;;
+esac
+
 print_startup_status
 print_next_steps

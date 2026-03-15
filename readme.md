@@ -89,38 +89,60 @@ etsu.exe
 
 ### Running in the background on macOS with `launchd`
 
-Build ETSU first:
+Use the installer:
+
+```bash
+./setup_macos.sh
+```
+
+That script:
+- backs up the live config and SQLite DB from `~/Library/Application Support/com.seatedro.etsu/`
+- builds release
+- installs a stable app bundle at `~/Applications/Etsu.app`
+- installs the LaunchAgent at `~/Library/LaunchAgents/com.seatedro.etsu.plist`
+- restarts ETSU and prints startup status
+
+If you want to run the pieces manually:
 
 ```bash
 cargo build --release
-```
-
-Then install the LaunchAgent:
-
-```bash
+./scripts/install_app_bundle.sh
 ./scripts/install_launchd.sh
 ```
 
-That installs `~/Library/LaunchAgents/com.seatedro.etsu.plist`, configures ETSU to restart on crash, and writes logs under `~/Library/Logs/etsu.launchd*.log`.
+The LaunchAgent runs `~/Applications/Etsu.app/Contents/MacOS/etsu` and writes logs under `~/Library/Logs/etsu.launchd*.log`.
 If you have an older local install using `com.nswanberg.etsu`, the installer will stop it first and keep a timestamped backup of the old plist.
+
+### Repeatable local installs on macOS
+
+macOS privacy permissions are tied to the app's code identity. Ad-hoc signatures can force you to re-grant `Input Monitoring` / `Accessibility` after reinstalls. For a stable local development loop, create a one-time local signing identity:
+
+```bash
+ETSU_CODESIGN_IDENTITY="ETSU Development" ./scripts/create_macos_dev_signing_identity.sh
+```
+
+Then rerun installs normally:
+
+```bash
+./setup_macos.sh
+```
+
+If no signing identity exists, ETSU still installs and runs, but the installer will warn that macOS permissions may not survive reinstalls.
 
 ### Installing on another Mac
 
-Use the installer script. It stops any existing ETSU process, backs up the live config and SQLite database from the default macOS paths, reuses the current device identity, rebuilds, and installs the LaunchAgent.
+Use the installer script. It stops any existing ETSU process, backs up the live config and SQLite database from the default macOS paths, reuses the current device identity, rebuilds, installs `~/Applications/Etsu.app`, and installs the LaunchAgent.
 
-It resolves the Postgres DSN (if used) from the first place that has one:
+It resolves remote sync settings in this order:
 
-1. `ETSU_POSTGRES_URL` environment variable
-2. `ETSU_POSTGRES_URL_OP_REF` (1Password CLI reference)
-3. existing `~/Library/Application Support/com.seatedro.etsu/config.toml`
-4. `ETSU_POSTGRES_URL_FILE`
-5. `~/Library/Application Support/com.seatedro.etsu/postgres_dsn.txt`
-6. `~/Library/Application Support/com.seatedro.etsu/postgres_url.txt`
-7. `~/Dropbox/Records/PersonalData/Etsu/postgres_dsn.txt`
-8. `~/Dropbox/Records/PersonalData/Etsu/postgres_url.txt`
-9. `~/Dropbox/Records/PersonalData/Etsu/supabase_dsn.txt`
-
-For Supabase REST API sync, set `supabase_url` and `supabase_api_key` in your config directly.
+1. Supabase REST via `ETSU_SUPABASE_URL` and `ETSU_SUPABASE_API_KEY`
+2. existing `~/Library/Application Support/com.seatedro.etsu/config.toml`
+3. `ETSU_SUPABASE_URL_FILE` and `ETSU_SUPABASE_API_KEY_FILE`
+4. `~/Library/Application Support/com.seatedro.etsu/supabase_url.txt`
+5. `~/Library/Application Support/com.seatedro.etsu/supabase_api_key.txt`
+6. `~/Dropbox/Records/PersonalData/Etsu/supabase_url.txt`
+7. `~/Dropbox/Records/PersonalData/Etsu/supabase_api_key.txt`
+8. Legacy Postgres via `ETSU_POSTGRES_URL`, `ETSU_POSTGRES_URL_OP_REF`, existing config, or the `postgres_*.txt` files
 
 From the repo root:
 
@@ -137,13 +159,19 @@ If you are already in `target/release`, run:
 Optional overrides:
 
 ```bash
+ETSU_SUPABASE_URL="https://your-project-ref.supabase.co" ETSU_SUPABASE_API_KEY="sb_publishable_..." ./setup_macos.sh
+ETSU_SUPABASE_URL_FILE="$HOME/Dropbox/Records/PersonalData/Etsu/supabase_url.txt" ETSU_SUPABASE_API_KEY_FILE="$HOME/Dropbox/Records/PersonalData/Etsu/supabase_api_key.txt" ./setup_macos.sh
 ETSU_POSTGRES_URL="postgresql://user:password@host:5432/postgres" ./setup_macos.sh
 ETSU_POSTGRES_URL_FILE="$HOME/Dropbox/Records/PersonalData/Etsu/postgres_dsn.txt" ./setup_macos.sh
 ETSU_POSTGRES_URL_OP_REF="op://Vault/Item/postgres_url" ./setup_macos.sh
 ETSU_BACKUP_DIR="$HOME/Dropbox/Records/PersonalData/Etsu/m2" ./setup_macos.sh
 ```
 
-For a new Mac without an existing ETSU config, the simplest setup is to put the DSN on a single line in `~/Dropbox/Records/PersonalData/Etsu/postgres_dsn.txt` and then run:
+For a new Mac without an existing ETSU config, the simplest setup is to put:
+- the Supabase URL on one line in `~/Dropbox/Records/PersonalData/Etsu/supabase_url.txt`
+- the publishable key on one line in `~/Dropbox/Records/PersonalData/Etsu/supabase_api_key.txt`
+
+Then run:
 
 ```bash
 ../../setup_macos.sh

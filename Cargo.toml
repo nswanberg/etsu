@@ -10,6 +10,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1.0.97"
 config = { version = "0.15.11", features = ["toml"] }
+core-foundation = "0.10.1"
 directories = "6.0.0"
 futures = "0.3.31"
 glfw = "0.59.0"

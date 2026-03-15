@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
     let executable_path = std::env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
+    platform::request_input_capture_permissions(&executable_path);
     let input_capture_permissions = platform::log_input_capture_permissions(&executable_path);
 
     if let Err(e) = platform::initialize_monitor_info() {

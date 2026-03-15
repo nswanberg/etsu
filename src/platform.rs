@@ -5,6 +5,14 @@ use tracing::{info, warn};
 use twox_hash::XxHash64;
 
 use glfw::Monitor as GlfwMonitor;
+#[cfg(target_os = "macos")]
+use core_foundation::base::TCFType;
+#[cfg(target_os = "macos")]
+use core_foundation::boolean::CFBoolean;
+#[cfg(target_os = "macos")]
+use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+#[cfg(target_os = "macos")]
+use core_foundation::string::{CFString, CFStringRef};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MonitorInfo {
@@ -53,7 +61,10 @@ pub enum PlatformError {
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
+    static kAXTrustedCheckOptionPrompt: CFStringRef;
     fn CGPreflightListenEventAccess() -> bool;
+    fn CGRequestListenEventAccess() -> bool;
 }
 
 pub fn detect_input_capture_permissions() -> InputCapturePermissions {
@@ -93,6 +104,33 @@ pub fn log_input_capture_permissions(executable_path: &str) -> InputCapturePermi
     }
 
     permissions
+}
+
+pub fn request_input_capture_permissions(executable_path: &str) {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let permissions = detect_input_capture_permissions();
+
+        if permissions.missing_input_monitoring() {
+            warn!(
+                "Input Monitoring permission is not granted for {}. Requesting the macOS permission prompt now.",
+                executable_path
+            );
+            let _ = CGRequestListenEventAccess();
+        }
+
+        if permissions.missing_accessibility() {
+            warn!(
+                "Accessibility permission is not granted for {}. Requesting the macOS permission prompt now.",
+                executable_path
+            );
+            let prompt_key = CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt);
+            let options = CFDictionary::from_CFType_pairs(&[
+                (prompt_key, CFBoolean::true_value()),
+            ]);
+            let _ = AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef());
+        }
+    }
 }
 
 /// Initializes GLFW, fetches monitor information, calculates PPI, caches it, and terminates GLFW.
