@@ -65,6 +65,9 @@ async fn main() -> Result<()> {
     platform::request_input_capture_permissions(&executable_path);
     let input_capture_permissions = platform::log_input_capture_permissions(&executable_path);
 
+    let input_capture_permissions =
+        wait_for_input_capture_permissions(&executable_path, input_capture_permissions).await;
+
     if let Err(e) = platform::initialize_monitor_info() {
         error!("Failed to initialize monitor info using GLFW: {}. Distance calculation might be inaccurate or use defaults.", e);
     }
@@ -205,6 +208,52 @@ async fn main() -> Result<()> {
 
     info!("Etsu shutdown complete.");
     Ok(())
+}
+
+/// Polls until both Input Monitoring and Accessibility permissions are granted.
+/// If they are already granted, returns immediately.
+/// Logs progress to the log file so the setup script / user can see what is happening.
+async fn wait_for_input_capture_permissions(
+    executable_path: &str,
+    initial: platform::InputCapturePermissions,
+) -> platform::InputCapturePermissions {
+    if !initial.missing_input_monitoring() && !initial.missing_accessibility() {
+        info!("All input capture permissions are granted.");
+        return initial;
+    }
+
+    let poll_interval = Duration::from_secs(2);
+    let mut logged_waiting = false;
+
+    loop {
+        let current = platform::detect_input_capture_permissions();
+
+        if !current.missing_input_monitoring() && !current.missing_accessibility() {
+            info!(
+                "Input capture permissions confirmed for {}. Proceeding with startup.",
+                executable_path
+            );
+            return current;
+        }
+
+        if !logged_waiting {
+            let mut missing = Vec::new();
+            if current.missing_input_monitoring() {
+                missing.push("Input Monitoring");
+            }
+            if current.missing_accessibility() {
+                missing.push("Accessibility");
+            }
+            warn!(
+                "Waiting for macOS permissions: {}. Grant them in System Settings > Privacy & Security for {}.",
+                missing.join(" and "),
+                executable_path
+            );
+            logged_waiting = true;
+        }
+
+        time::sleep(poll_interval).await;
+    }
 }
 
 /// Sets up the signal handlers for SIGTERM, SIGINT, and SIGQUIT

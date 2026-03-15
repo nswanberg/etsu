@@ -9,7 +9,7 @@ TMP_DIR="$(mktemp -d)"
 CERT_PEM="$TMP_DIR/etsu-dev-cert.pem"
 KEY_PEM="$TMP_DIR/etsu-dev-key.pem"
 P12_PATH="$TMP_DIR/etsu-dev-codesign.p12"
-P12_PASS="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)"
+P12_PASS="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 || true)"
 
 cleanup() {
   rm -rf "$TMP_DIR"
@@ -54,7 +54,8 @@ note "Creating self-signed codesigning identity: $IDENTITY_NAME"
   -in "$CERT_PEM" \
   -name "$IDENTITY_NAME" \
   -out "$P12_PATH" \
-  -passout "pass:$P12_PASS"
+  -passout "pass:$P12_PASS" \
+  -legacy
 
 security import "$P12_PATH" \
   -k "$KEYCHAIN_PATH" \

@@ -405,38 +405,35 @@ print_startup_status() {
   local _attempt
   local remote_status="unknown"
   local capture_status="unknown"
+  local max_wait=120
+  local waited=0
+  local prompted_user=0
 
+  # Quick initial wait for the log to appear
   for _attempt in 1 2 3 4 5; do
     log_path="$(latest_log_path)"
-
-    if [[ -f "$log_path" ]]; then
-      startup_lines="$(tail -n 120 "$log_path")"
-
-      if grep -Fq "Supabase REST API connected at" <<< "$startup_lines"; then
-        remote_status="connected"
-      elif grep -Fq "Remote Postgres pool created." <<< "$startup_lines"; then
-        remote_status="connected"
-      elif grep -Fq "Failed to connect to remote Postgres DB:" <<< "$startup_lines"; then
-        remote_status="failed"
-      elif grep -Fq "Supabase REST API returned HTTP" <<< "$startup_lines"; then
-        remote_status="failed"
-      elif grep -Fq "Failed to reach Supabase REST API at" <<< "$startup_lines"; then
-        remote_status="failed"
-      elif grep -Fq "No remote Postgres URL configured." <<< "$startup_lines"; then
-        remote_status="disabled"
-      fi
-
-      if grep -Fq "Input Monitoring permission is not granted" <<< "$startup_lines"; then
-        capture_status="input_monitoring_missing"
-      elif grep -Fq "Accessibility permission is not granted" <<< "$startup_lines"; then
-        capture_status="accessibility_missing"
-      elif grep -Fq "Input capture confirmed: first keyboard or mouse event received." <<< "$startup_lines"; then
-        capture_status="confirmed"
-      fi
-    fi
-
+    [[ -f "$log_path" ]] && break
     sleep 1
   done
+
+  # Check remote sync status (non-blocking, just report)
+  if [[ -f "$log_path" ]]; then
+    startup_lines="$(tail -n 120 "$log_path")"
+
+    if grep -Fq "Supabase REST API connected at" <<< "$startup_lines"; then
+      remote_status="connected"
+    elif grep -Fq "Remote Postgres pool created." <<< "$startup_lines"; then
+      remote_status="connected"
+    elif grep -Fq "Failed to connect to remote Postgres DB:" <<< "$startup_lines"; then
+      remote_status="failed"
+    elif grep -Fq "Supabase REST API returned HTTP" <<< "$startup_lines"; then
+      remote_status="failed"
+    elif grep -Fq "Failed to reach Supabase REST API at" <<< "$startup_lines"; then
+      remote_status="failed"
+    elif grep -Fq "No remote Postgres URL configured." <<< "$startup_lines"; then
+      remote_status="disabled"
+    fi
+  fi
 
   case "$remote_status" in
     connected)
@@ -462,15 +459,80 @@ print_startup_status() {
       ;;
   esac
 
+  # Poll for input capture permissions until confirmed or timeout.
+  # When the user grants permissions, macOS often requires a process restart
+  # for them to take effect. We detect this and restart via launchd automatically.
+  local restarted=0
+
+  while (( waited < max_wait )); do
+    log_path="$(latest_log_path)"
+    if [[ -f "$log_path" ]]; then
+      startup_lines="$(tail -n 120 "$log_path")"
+
+      if grep -Fq "Input capture permissions confirmed" <<< "$startup_lines" ||
+         grep -Fq "All input capture permissions are granted" <<< "$startup_lines"; then
+        capture_status="confirmed"
+        break
+      fi
+
+      if grep -Fq "Waiting for macOS permissions" <<< "$startup_lines"; then
+        capture_status="waiting"
+        if (( prompted_user == 0 )); then
+          note ""
+          note "ETSU is waiting for macOS permissions before it can capture input."
+          note "Open System Settings > Privacy & Security and grant both:"
+          note "  1. Input Monitoring   -> $INSTALLED_BIN_PATH"
+          note "  2. Accessibility      -> $INSTALLED_BIN_PATH"
+          note ""
+          note "This script will wait for you to grant them, then restart ETSU automatically..."
+          prompted_user=1
+        fi
+
+        # Check if the user has granted permissions even though the running
+        # process can't see them yet (macOS requires restart after grant).
+        # Use the binary itself to probe -- CGPreflightListenEventAccess and
+        # AXIsProcessTrusted reflect the TCC database, not the running
+        # process's cached state, so a fresh invocation will see the update.
+        # We can't easily call the binary to check, so instead we just
+        # restart periodically while waiting. If the user granted permissions,
+        # the restarted process will see them immediately.
+        if (( waited > 0 && waited % 10 == 0 && restarted == 0 )); then
+          # Try a restart to pick up any newly granted permissions
+          launchctl stop "$PRIMARY_LABEL" 2>/dev/null || true
+          sleep 2
+          launchctl start "$PRIMARY_LABEL" 2>/dev/null || true
+          restarted=1
+          # Give the new process time to start and log
+          sleep 3
+          waited=$((waited + 5))
+          continue
+        fi
+
+        # After the first restart didn't help, try again every 20s
+        if (( restarted == 1 && waited % 20 == 0 )); then
+          launchctl stop "$PRIMARY_LABEL" 2>/dev/null || true
+          sleep 2
+          launchctl start "$PRIMARY_LABEL" 2>/dev/null || true
+          sleep 3
+          waited=$((waited + 5))
+          continue
+        fi
+      fi
+    fi
+
+    sleep 2
+    waited=$((waited + 2))
+  done
+
   case "$capture_status" in
-    input_monitoring_missing)
-      warn "Input capture: Input Monitoring permission missing for the ETSU binary"
-      ;;
-    accessibility_missing)
-      warn "Input capture: Accessibility permission missing for the ETSU binary"
-      ;;
     confirmed)
-      note "Input capture: confirmed"
+      note "Input capture: confirmed -- ETSU is recording keystrokes and mouse events."
+      ;;
+    waiting)
+      warn "Input capture: still waiting for permissions after ${waited}s."
+      warn "Grant Input Monitoring and Accessibility for $INSTALLED_BIN_PATH in System Settings."
+      warn "Then restart manually:"
+      warn "  launchctl stop $PRIMARY_LABEL && sleep 2 && launchctl start $PRIMARY_LABEL"
       ;;
     *)
       if [[ -f "$log_path" ]]; then
