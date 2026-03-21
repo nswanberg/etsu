@@ -16,7 +16,7 @@ use error::AppError;
 use state::MetricsState;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time;
 use tracing::{debug, error, info, warn};
@@ -217,16 +217,37 @@ async fn wait_for_input_capture_permissions(
     executable_path: &str,
     initial: platform::InputCapturePermissions,
 ) -> platform::InputCapturePermissions {
+    fn missing_permissions(permissions: platform::InputCapturePermissions) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if permissions.missing_input_monitoring() {
+            missing.push("Input Monitoring");
+        }
+        if permissions.missing_accessibility() {
+            missing.push("Accessibility");
+        }
+        missing
+    }
+
     if !initial.missing_input_monitoring() && !initial.missing_accessibility() {
         info!("All input capture permissions are granted.");
         return initial;
     }
 
     let poll_interval = Duration::from_secs(2);
-    let mut logged_waiting = false;
+    let reprompt_interval = Duration::from_secs(15);
+    let mut last_missing = (
+        initial.missing_input_monitoring(),
+        initial.missing_accessibility(),
+    );
+    let mut last_logged_missing = None;
+    let mut last_reprompt = Instant::now();
 
     loop {
         let current = platform::detect_input_capture_permissions();
+        let current_missing = (
+            current.missing_input_monitoring(),
+            current.missing_accessibility(),
+        );
 
         if !current.missing_input_monitoring() && !current.missing_accessibility() {
             info!(
@@ -236,20 +257,38 @@ async fn wait_for_input_capture_permissions(
             return current;
         }
 
-        if !logged_waiting {
-            let mut missing = Vec::new();
-            if current.missing_input_monitoring() {
-                missing.push("Input Monitoring");
-            }
-            if current.missing_accessibility() {
-                missing.push("Accessibility");
-            }
+        if current_missing != last_missing {
+            let missing = missing_permissions(current);
             warn!(
-                "Waiting for macOS permissions: {}. Grant them in System Settings > Privacy & Security for {}.",
+                "macOS permission state changed. Still missing: {}. Re-requesting access for {}.",
                 missing.join(" and "),
                 executable_path
             );
-            logged_waiting = true;
+            platform::request_input_capture_permissions(executable_path);
+            platform::log_input_capture_permissions(executable_path);
+            last_missing = current_missing;
+        }
+
+        if last_logged_missing != Some(current_missing) {
+            let missing = missing_permissions(current);
+            warn!(
+                "Waiting for macOS permissions: {}. Grant them in System Settings > Privacy & Security for {}. macOS may only show one visible dialog; ETSU will keep re-requesting any remaining permission.",
+                missing.join(" and "),
+                executable_path
+            );
+            last_logged_missing = Some(current_missing);
+        }
+
+        if last_reprompt.elapsed() >= reprompt_interval {
+            let missing = missing_permissions(current);
+            warn!(
+                "Still missing macOS permissions: {}. Re-requesting access for {}.",
+                missing.join(" and "),
+                executable_path
+            );
+            platform::request_input_capture_permissions(executable_path);
+            platform::log_input_capture_permissions(executable_path);
+            last_reprompt = Instant::now();
         }
 
         time::sleep(poll_interval).await;

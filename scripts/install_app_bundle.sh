@@ -60,11 +60,13 @@ EOF
 
 sign_app_bundle() {
   local identity_line
+  local identity_hash
 
   identity_line="$(find_codesign_identity "$CODESIGN_IDENTITY_NAME" || true)"
   if [[ -n "$identity_line" ]]; then
-    codesign --force --sign "$CODESIGN_IDENTITY_NAME" "$APP_BUNDLE_PATH"
-    note "Signed Etsu.app with local identity: $CODESIGN_IDENTITY_NAME"
+    identity_hash="$(printf '%s\n' "$identity_line" | awk '{print $2}')"
+    codesign --force --sign "$identity_hash" "$APP_BUNDLE_PATH"
+    note "Signed Etsu.app with local identity: $CODESIGN_IDENTITY_NAME ($identity_hash)"
     return
   fi
 

@@ -21,6 +21,7 @@ SUPABASE_API_KEY_FILE="${ETSU_SUPABASE_API_KEY_FILE:-}"
 DEVICE_ID="${ETSU_DEVICE_ID:-}"
 DEVICE_NAME="${ETSU_DEVICE_NAME:-}"
 SKIP_BUILD="${ETSU_SKIP_BUILD:-0}"
+PERMISSION_WAIT_TIMEOUT_SECONDS="${ETSU_PERMISSION_WAIT_TIMEOUT_SECONDS:-90}"
 APP_BUNDLE_PATH="${ETSU_APP_BUNDLE_PATH:-$HOME/Applications/Etsu.app}"
 BUILD_BIN_PATH="$REPO_ROOT/target/release/etsu"
 INSTALLED_BIN_PATH="$APP_BUNDLE_PATH/Contents/MacOS/etsu"
@@ -399,15 +400,70 @@ latest_log_path() {
   find "$APP_SUPPORT_DIR" -maxdepth 1 -type f -name 'etsu.log.*' -print | sort | tail -n 1
 }
 
+latest_startup_segment() {
+  awk '
+    / INFO etsu: Loaded configuration$/ { start = NR }
+    { lines[NR] = $0 }
+    END {
+      if (NR == 0) {
+        exit 0
+      }
+      if (start == 0) {
+        start = 1
+      }
+      for (i = start; i <= NR; i++) {
+        print lines[i]
+      }
+    }
+  '
+}
+
+last_fixed_match_line() {
+  local needle="$1"
+  awk -v needle="$needle" '
+    index($0, needle) { last = NR }
+    END { print last + 0 }
+  '
+}
+
+latest_waiting_permissions_line() {
+  awk '
+    /Waiting for macOS permissions:/ { line = $0 }
+    END { print line }
+  '
+}
+
+open_privacy_settings_pane() {
+  local pane="$1"
+  local url=""
+
+  case "$pane" in
+    input_monitoring)
+      url="x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+      ;;
+    accessibility)
+      url="x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  open -g "$url" >/dev/null 2>&1 || true
+}
+
 print_startup_status() {
   local log_path
   local startup_lines
+  local current_run_lines
   local _attempt
   local remote_status="unknown"
   local capture_status="unknown"
-  local max_wait=120
+  local max_wait="$PERMISSION_WAIT_TIMEOUT_SECONDS"
   local waited=0
   local prompted_user=0
+  local opened_input_pane=0
+  local opened_accessibility_pane=0
 
   # Quick initial wait for the log to appear
   for _attempt in 1 2 3 4 5; do
@@ -419,18 +475,19 @@ print_startup_status() {
   # Check remote sync status (non-blocking, just report)
   if [[ -f "$log_path" ]]; then
     startup_lines="$(tail -n 120 "$log_path")"
+    current_run_lines="$(printf '%s\n' "$startup_lines" | latest_startup_segment)"
 
-    if grep -Fq "Supabase REST API connected at" <<< "$startup_lines"; then
+    if grep -Fq "Supabase REST API connected at" <<< "$current_run_lines"; then
       remote_status="connected"
-    elif grep -Fq "Remote Postgres pool created." <<< "$startup_lines"; then
+    elif grep -Fq "Remote Postgres pool created." <<< "$current_run_lines"; then
       remote_status="connected"
-    elif grep -Fq "Failed to connect to remote Postgres DB:" <<< "$startup_lines"; then
+    elif grep -Fq "Failed to connect to remote Postgres DB:" <<< "$current_run_lines"; then
       remote_status="failed"
-    elif grep -Fq "Supabase REST API returned HTTP" <<< "$startup_lines"; then
+    elif grep -Fq "Supabase REST API returned HTTP" <<< "$current_run_lines"; then
       remote_status="failed"
-    elif grep -Fq "Failed to reach Supabase REST API at" <<< "$startup_lines"; then
+    elif grep -Fq "Failed to reach Supabase REST API at" <<< "$current_run_lines"; then
       remote_status="failed"
-    elif grep -Fq "No remote Postgres URL configured." <<< "$startup_lines"; then
+    elif grep -Fq "No remote Postgres URL configured." <<< "$current_run_lines"; then
       remote_status="disabled"
     fi
   fi
@@ -464,28 +521,65 @@ print_startup_status() {
   # for them to take effect. We detect this and restart via launchd automatically.
   local restarted=0
 
-  while (( waited < max_wait )); do
+  while (( max_wait <= 0 || waited < max_wait )); do
+    local capture_confirmed_line=0
+    local capture_resumed_line=0
+    local permissions_granted_line=0
+    local waiting_line=0
+    local latest_waiting_line=""
+    local missing_input=0
+    local missing_accessibility=0
+
     log_path="$(latest_log_path)"
     if [[ -f "$log_path" ]]; then
       startup_lines="$(tail -n 120 "$log_path")"
+      current_run_lines="$(printf '%s\n' "$startup_lines" | latest_startup_segment)"
 
-      if grep -Fq "Input capture permissions confirmed" <<< "$startup_lines" ||
-         grep -Fq "All input capture permissions are granted" <<< "$startup_lines"; then
+      capture_confirmed_line="$(printf '%s\n' "$current_run_lines" | last_fixed_match_line "Input capture confirmed:")"
+      capture_resumed_line="$(printf '%s\n' "$current_run_lines" | last_fixed_match_line "Input capture resumed after an idle warning.")"
+      permissions_granted_line="$(printf '%s\n' "$current_run_lines" | last_fixed_match_line "All input capture permissions are granted.")"
+      waiting_line="$(printf '%s\n' "$current_run_lines" | last_fixed_match_line "Waiting for macOS permissions:")"
+      latest_waiting_line="$(printf '%s\n' "$current_run_lines" | latest_waiting_permissions_line)"
+      [[ "$latest_waiting_line" == *"Input Monitoring"* ]] && missing_input=1
+      [[ "$latest_waiting_line" == *"Accessibility"* ]] && missing_accessibility=1
+
+      if (( capture_confirmed_line > 0 || capture_resumed_line > 0 )); then
         capture_status="confirmed"
         break
       fi
 
-      if grep -Fq "Waiting for macOS permissions" <<< "$startup_lines"; then
+      if (( waiting_line > permissions_granted_line )); then
         capture_status="waiting"
         if (( prompted_user == 0 )); then
           note ""
           note "ETSU is waiting for macOS permissions before it can capture input."
-          note "Open System Settings > Privacy & Security and grant both:"
-          note "  1. Input Monitoring   -> $INSTALLED_BIN_PATH"
-          note "  2. Accessibility      -> $INSTALLED_BIN_PATH"
+          note "Open System Settings > Privacy & Security and enable the missing items for:"
+          note "  $INSTALLED_BIN_PATH"
           note ""
-          note "This script will wait for you to grant them, then restart ETSU automatically..."
+          note "macOS may only show one visible dialog even when both permissions are missing."
+          note "This script will keep opening the remaining pane and restarting ETSU automatically."
+          note ""
           prompted_user=1
+        fi
+
+        if (( missing_input == 1 && opened_input_pane == 0 )); then
+          note "Opening System Settings to Input Monitoring..."
+          open_privacy_settings_pane input_monitoring
+          opened_input_pane=1
+        fi
+
+        if (( missing_input == 0 )); then
+          opened_input_pane=0
+        fi
+
+        if (( missing_accessibility == 1 && missing_input == 0 && opened_accessibility_pane == 0 )); then
+          note "Opening System Settings to Accessibility..."
+          open_privacy_settings_pane accessibility
+          opened_accessibility_pane=1
+        fi
+
+        if (( missing_accessibility == 0 )); then
+          opened_accessibility_pane=0
         fi
 
         # Check if the user has granted permissions even though the running
@@ -527,17 +621,20 @@ print_startup_status() {
   case "$capture_status" in
     confirmed)
       note "Input capture: confirmed -- ETSU is recording keystrokes and mouse events."
+      return 0
       ;;
     waiting)
       warn "Input capture: still waiting for permissions after ${waited}s."
-      warn "Grant Input Monitoring and Accessibility for $INSTALLED_BIN_PATH in System Settings."
+      warn "Grant the remaining macOS permissions for $INSTALLED_BIN_PATH in System Settings."
       warn "Then restart manually:"
       warn "  launchctl stop $PRIMARY_LABEL && sleep 2 && launchctl start $PRIMARY_LABEL"
+      return 1
       ;;
     *)
       if [[ -f "$log_path" ]]; then
         note "Input capture: check $log_path"
       fi
+      return 1
       ;;
   esac
 }
@@ -615,4 +712,6 @@ case "$REMOTE_MODE" in
 esac
 
 print_startup_status
+startup_status=$?
 print_next_steps
+exit "$startup_status"

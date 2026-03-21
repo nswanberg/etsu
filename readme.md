@@ -52,6 +52,25 @@ device_name = "Your Mac"
 
 ETSU syncs all local SQLite rows to Supabase via the REST API every save interval. Unsynced rows are tracked with a `supabase_synced_at` column, so historical data is backfilled automatically on first connect.
 
+`metrics.timestamp` is captured and synced as UTC. If you also want the machine-local wall clock context for reporting, add these columns on the Supabase side before restarting ETSU:
+
+```sql
+alter table public.metrics
+  alter column "timestamp" type timestamptz
+  using "timestamp" at time zone 'UTC';
+
+alter table public.metrics
+  alter column "timestamp" set default now();
+
+alter table public.metrics
+  add column if not exists timestamp_local timestamp,
+  add column if not exists local_utc_offset_minutes integer;
+```
+
+ETSU will start populating `timestamp_local` and `local_utc_offset_minutes` locally right away, and it will only include those fields in Supabase REST sync once the remote `metrics` table exposes them. That makes the rollout safe to stage behind your downstream schema migration.
+
+If you want every future Supabase row to include the extra local-time fields, apply the schema change before restarting the upgraded ETSU binary on each Mac. Rows that were already synced before the remote columns existed are not backfilled automatically.
+
 ### Legacy direct Postgres
 
 ```toml
@@ -62,6 +81,7 @@ postgres_url = "postgresql://user:password@host:5432/postgres"
 Note: Supabase's direct Postgres endpoint is IPv6-only, which may not work on all networks. The REST API (above) is IPv4 and works everywhere.
 
 If `identity.device_id` or `identity.device_name` is missing, ETSU will generate and persist them into the config file on first launch.
+Keep those values local to each machine. Do not commit real device IDs, UUIDs, or hostnames to the public repo.
 
 ### Configuration File Locations
 
@@ -152,6 +172,8 @@ The setup script will:
 5. Auto-restart ETSU after you grant permissions
 6. Confirm input capture is working
 
+If the Mac was previously running `target/release/etsu` manually from a terminal, `./setup_macos.sh` will stop that process and replace it with the managed `~/Applications/Etsu.app` + LaunchAgent install.
+
 The setup script resolves Supabase credentials from (in order):
 
 1. `ETSU_SUPABASE_URL` and `ETSU_SUPABASE_API_KEY` env vars
@@ -172,6 +194,28 @@ ETSU_SUPABASE_URL="$(op read 'op://Vault/Etsu/supabase_url')" \
   ETSU_SUPABASE_API_KEY="$(op read 'op://Vault/Etsu/supabase_api_key')" \
   ./setup_macos.sh
 ```
+
+### Updating an existing second Mac
+
+If the second Mac is already running ETSU and already has its own local SQLite history, the update path is intentionally short:
+
+```bash
+# From target/release
+git -C ../.. pull --ff-only
+../../setup_macos.sh
+```
+
+or:
+
+```bash
+# From the repo root
+git pull --ff-only
+./setup_macos.sh
+```
+
+That preserves the existing local database and device identity, takes a backup first, and replaces any old terminal-run ETSU process with the managed `~/Applications/Etsu.app` install.
+
+See [SECOND_MAC_RUNBOOK.md](SECOND_MAC_RUNBOOK.md) for the full operator checklist.
 
 ### Viewing Statistics
 

@@ -25,6 +25,20 @@ warn() {
   printf '%s\n' "$*" >&2
 }
 
+cert_and_key_exist() {
+  security find-certificate -c "$IDENTITY_NAME" "$KEYCHAIN_PATH" >/dev/null 2>&1 \
+    && security find-key -l "$IDENTITY_NAME" "$KEYCHAIN_PATH" >/dev/null 2>&1
+}
+
+trust_existing_identity() {
+  security find-certificate -c "$IDENTITY_NAME" -p "$KEYCHAIN_PATH" > "$CERT_PEM"
+  security add-trusted-cert \
+    -p codeSign \
+    -r trustRoot \
+    -k "$KEYCHAIN_PATH" \
+    "$CERT_PEM"
+}
+
 if [[ -z "$OPENSSL_BIN" ]]; then
   warn "openssl is required but was not found."
   exit 1
@@ -33,6 +47,17 @@ fi
 if security find-identity -v -p codesigning 2>/dev/null | grep -Fq "\"$IDENTITY_NAME\""; then
   note "Codesigning identity already exists: $IDENTITY_NAME"
   exit 0
+fi
+
+if cert_and_key_exist; then
+  note "Existing certificate/key found for $IDENTITY_NAME; updating trust settings..."
+  trust_existing_identity
+
+  if security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -Fq "\"$IDENTITY_NAME\""; then
+    note "Created codesigning identity: $IDENTITY_NAME"
+    security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -F "\"$IDENTITY_NAME\""
+    exit 0
+  fi
 fi
 
 note "Creating self-signed codesigning identity: $IDENTITY_NAME"
@@ -62,6 +87,8 @@ security import "$P12_PATH" \
   -P "$P12_PASS" \
   -T /usr/bin/codesign \
   -T /usr/bin/security
+
+trust_existing_identity
 
 if [[ -n "${ETSU_KEYCHAIN_PASSWORD:-}" ]]; then
   security set-key-partition-list \

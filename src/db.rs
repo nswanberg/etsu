@@ -1,7 +1,8 @@
 use crate::config::{DeviceIdentity, RemoteDatabaseSettings};
 use crate::error::Result;
+use chrono::{DateTime, Local, NaiveDateTime, Utc};
 use postgrest::Postgrest;
-use sea_query::{Alias, Expr, Iden, PostgresQueryBuilder, Query, SqliteQueryBuilder};
+use sea_query::{Alias, Expr, Iden, Query, SqliteQueryBuilder};
 use sea_query_binder::SqlxBinder;
 use sqlx::{migrate::Migrator, PgPool, Pool, Postgres, Sqlite, SqlitePool, Transaction};
 use std::path::Path;
@@ -19,12 +20,18 @@ enum MetricsIden {
     Keypresses,
     MouseClicks,
     MouseDistanceIn,
+    #[allow(dead_code)]
     MouseDistanceMi,
     ScrollSteps,
     DeviceId,
+    #[allow(dead_code)]
     DeviceName,
     #[allow(dead_code)]
     Timestamp,
+    #[allow(dead_code)]
+    TimestampLocal,
+    #[allow(dead_code)]
+    LocalUtcOffsetMinutes,
 }
 
 #[derive(Iden)]
@@ -48,6 +55,57 @@ pub struct MetricsData {
     pub mouse_clicks: usize,
     pub scroll_steps: usize,
     pub mouse_distance_in: f64,
+}
+
+#[derive(Debug, Clone)]
+struct CaptureTimestamps {
+    utc: DateTime<Utc>,
+    local: DateTime<Local>,
+}
+
+impl CaptureTimestamps {
+    fn now() -> Self {
+        let utc = Utc::now();
+        let local = utc.with_timezone(&Local);
+        Self { utc, local }
+    }
+
+    fn utc_naive(&self) -> NaiveDateTime {
+        self.utc.naive_utc()
+    }
+
+    fn local_naive(&self) -> NaiveDateTime {
+        self.local.naive_local()
+    }
+
+    fn local_utc_offset_minutes(&self) -> i32 {
+        self.local.offset().local_minus_utc() / 60
+    }
+}
+
+fn parse_sqlite_timestamp(value: &str) -> Option<NaiveDateTime> {
+    const SQLITE_TIMESTAMP_FORMATS: [&str; 4] = [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+    ];
+
+    SQLITE_TIMESTAMP_FORMATS
+        .iter()
+        .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
+}
+
+fn sqlite_utc_timestamp_for_remote(value: &str) -> String {
+    parse_sqlite_timestamp(value)
+        .map(|timestamp| DateTime::<Utc>::from_naive_utc_and_offset(timestamp, Utc).to_rfc3339())
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn sqlite_local_timestamp_for_remote(value: &str) -> String {
+    parse_sqlite_timestamp(value)
+        .map(|timestamp| timestamp.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
+        .unwrap_or_else(|| value.to_string())
 }
 
 #[instrument(skip(remote_settings))]
@@ -288,30 +346,34 @@ async fn persist_metrics_sqlite_in_tx(
     identity: &DeviceIdentity,
 ) -> Result<()> {
     let distance_mi = data.mouse_distance_in / 63360.0;
+    let capture_timestamps = CaptureTimestamps::now();
 
-    let mut query_metrics = Query::insert();
-    query_metrics
-        .into_table(MetricsIden::Table)
-        .columns([
-            MetricsIden::Keypresses,
-            MetricsIden::MouseClicks,
-            MetricsIden::ScrollSteps,
-            MetricsIden::MouseDistanceIn,
-            MetricsIden::MouseDistanceMi,
-            MetricsIden::DeviceId,
-            MetricsIden::DeviceName,
-        ])
-        .values_panic([
-            (data.keypresses as i64).into(),
-            (data.mouse_clicks as i64).into(),
-            (data.scroll_steps as i64).into(),
-            data.mouse_distance_in.into(),
-            distance_mi.into(),
-            identity.device_id.clone().into(),
-            identity.device_name.clone().into(),
-        ]);
-    let (sql_metrics, values_metrics) = query_metrics.build_sqlx(SqliteQueryBuilder);
-    sqlx::query_with(&sql_metrics, values_metrics)
+    sqlx::query(
+        r#"
+        INSERT INTO metrics (
+            keypresses,
+            mouse_clicks,
+            scroll_steps,
+            mouse_distance_in,
+            mouse_distance_mi,
+            device_id,
+            device_name,
+            timestamp,
+            timestamp_local,
+            local_utc_offset_minutes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+        .bind(data.keypresses as i64)
+        .bind(data.mouse_clicks as i64)
+        .bind(data.scroll_steps as i64)
+        .bind(data.mouse_distance_in)
+        .bind(distance_mi)
+        .bind(&identity.device_id)
+        .bind(&identity.device_name)
+        .bind(capture_timestamps.utc_naive())
+        .bind(capture_timestamps.local_naive())
+        .bind(capture_timestamps.local_utc_offset_minutes())
         .execute(&mut **tx)
         .await?;
 
@@ -324,30 +386,34 @@ async fn persist_metrics_postgres_in_tx(
     identity: &DeviceIdentity,
 ) -> Result<()> {
     let distance_mi = data.mouse_distance_in / 63360.0;
+    let capture_timestamps = CaptureTimestamps::now();
 
-    let mut query_metrics = Query::insert();
-    query_metrics
-        .into_table(MetricsIden::Table)
-        .columns([
-            MetricsIden::Keypresses,
-            MetricsIden::MouseClicks,
-            MetricsIden::ScrollSteps,
-            MetricsIden::MouseDistanceIn,
-            MetricsIden::MouseDistanceMi,
-            MetricsIden::DeviceId,
-            MetricsIden::DeviceName,
-        ])
-        .values_panic([
-            (data.keypresses as i64).into(),
-            (data.mouse_clicks as i64).into(),
-            (data.scroll_steps as i64).into(),
-            data.mouse_distance_in.into(),
-            distance_mi.into(),
-            identity.device_id.clone().into(),
-            identity.device_name.clone().into(),
-        ]);
-    let (sql_metrics, values_metrics) = query_metrics.build_sqlx(PostgresQueryBuilder);
-    sqlx::query_with(&sql_metrics, values_metrics)
+    sqlx::query(
+        r#"
+        INSERT INTO metrics (
+            keypresses,
+            mouse_clicks,
+            scroll_steps,
+            mouse_distance_in,
+            mouse_distance_mi,
+            device_id,
+            device_name,
+            timestamp,
+            timestamp_local,
+            local_utc_offset_minutes
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        "#,
+    )
+        .bind(data.keypresses as i64)
+        .bind(data.mouse_clicks as i64)
+        .bind(data.scroll_steps as i64)
+        .bind(data.mouse_distance_in)
+        .bind(distance_mi)
+        .bind(&identity.device_id)
+        .bind(&identity.device_name)
+        .bind(capture_timestamps.utc)
+        .bind(capture_timestamps.local_naive())
+        .bind(capture_timestamps.local_utc_offset_minutes())
         .execute(&mut **tx)
         .await?;
 
@@ -447,6 +513,7 @@ const SUPABASE_BATCH_SIZE: u32 = 100;
 #[derive(Clone)]
 pub struct SupabaseClient {
     client: Postgrest,
+    supports_local_time_columns: bool,
 }
 
 pub async fn setup_supabase_client(
@@ -487,7 +554,34 @@ pub async fn setup_supabase_client(
         }
     }
 
-    Some(SupabaseClient { client })
+    let supports_local_time_columns = match client
+        .from("metrics")
+        .select("timestamp_local,local_utc_offset_minutes")
+        .limit(0)
+        .execute()
+        .await
+    {
+        Ok(r) if r.status().is_success() => true,
+        Ok(r) => {
+            warn!(
+                "Supabase metrics table does not yet expose timestamp_local/local_utc_offset_minutes (HTTP {}). Continuing without local timestamp sync.",
+                r.status()
+            );
+            false
+        }
+        Err(e) => {
+            warn!(
+                "Failed to probe Supabase local timestamp columns: {}. Continuing without local timestamp sync.",
+                e
+            );
+            false
+        }
+    };
+
+    Some(SupabaseClient {
+        client,
+        supports_local_time_columns,
+    })
 }
 
 /// Sync all unsynced local SQLite rows to Supabase in batches. Returns the number of rows synced.
@@ -498,8 +592,8 @@ pub async fn sync_to_supabase(
     let mut total_synced: u64 = 0;
 
     loop {
-        let rows = sqlx::query_as::<_, (i64, i64, i64, i64, f64, f64, Option<String>, Option<String>, String)>(
-            r#"SELECT id, keypresses, mouse_clicks, scroll_steps, mouse_distance_in, mouse_distance_mi, device_id, device_name, timestamp
+        let rows = sqlx::query_as::<_, (i64, i64, i64, i64, f64, f64, Option<String>, Option<String>, String, Option<String>, Option<i32>)>(
+            r#"SELECT id, keypresses, mouse_clicks, scroll_steps, mouse_distance_in, mouse_distance_mi, device_id, device_name, timestamp, timestamp_local, local_utc_offset_minutes
                FROM metrics
                WHERE supabase_synced_at IS NULL
                ORDER BY id ASC
@@ -520,16 +614,55 @@ pub async fn sync_to_supabase(
         let json_rows: Vec<serde_json::Value> = rows
             .iter()
             .map(|r| {
-                serde_json::json!({
-                    "keypresses": r.1,
-                    "mouse_clicks": r.2,
-                    "scroll_steps": r.3,
-                    "mouse_distance_in": r.4,
-                    "mouse_distance_mi": r.5,
-                    "device_id": r.6,
-                    "device_name": r.7,
-                    "timestamp": r.8,
-                })
+                let mut row = serde_json::Map::from_iter([
+                    (
+                        "keypresses".to_string(),
+                        serde_json::json!(r.1),
+                    ),
+                    (
+                        "mouse_clicks".to_string(),
+                        serde_json::json!(r.2),
+                    ),
+                    (
+                        "scroll_steps".to_string(),
+                        serde_json::json!(r.3),
+                    ),
+                    (
+                        "mouse_distance_in".to_string(),
+                        serde_json::json!(r.4),
+                    ),
+                    (
+                        "mouse_distance_mi".to_string(),
+                        serde_json::json!(r.5),
+                    ),
+                    (
+                        "device_id".to_string(),
+                        serde_json::json!(r.6),
+                    ),
+                    (
+                        "device_name".to_string(),
+                        serde_json::json!(r.7),
+                    ),
+                    (
+                        "timestamp".to_string(),
+                        serde_json::json!(sqlite_utc_timestamp_for_remote(&r.8)),
+                    ),
+                ]);
+
+                if supabase.supports_local_time_columns {
+                    row.insert(
+                        "timestamp_local".to_string(),
+                        serde_json::json!(
+                            r.9.as_deref().map(sqlite_local_timestamp_for_remote)
+                        ),
+                    );
+                    row.insert(
+                        "local_utc_offset_minutes".to_string(),
+                        serde_json::json!(r.10),
+                    );
+                }
+
+                serde_json::Value::Object(row)
             })
             .collect();
 
