@@ -139,7 +139,6 @@ async fn main() -> Result<()> {
     let saving_interval = settings.saving_interval();
     let sqlite_pool_clone = sqlite_pool.clone();
     let pg_pool_option_clone = pg_pool_option.clone();
-    let supabase_option_clone = supabase_option.clone();
     let identity_clone = identity.clone();
 
     let mut shutdown_rx2 = shutdown_tx.subscribe();
@@ -149,7 +148,6 @@ async fn main() -> Result<()> {
                 metrics_state_clone,
                 sqlite_pool_clone,
                 pg_pool_option_clone,
-                supabase_option_clone,
                 identity_clone,
                 saving_interval,
             ) => res,
@@ -159,6 +157,27 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    let sync_handle = if let Some(supabase) = supabase_option {
+        let sqlite_pool_clone = sqlite_pool.clone();
+        let sync_interval = settings.saving_interval();
+        let mut shutdown_rx_sync = shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            tokio::select! {
+                res = persistence::sync_to_remote_periodically(
+                    supabase,
+                    sqlite_pool_clone,
+                    sync_interval,
+                ) => res,
+                _ = shutdown_rx_sync.recv() => {
+                    debug!("Remote sync task received shutdown signal");
+                    Ok(())
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     info!("All tasks spawned. Etsu running in background.");
     info!("Press Ctrl+C to exit");
@@ -177,11 +196,19 @@ async fn main() -> Result<()> {
 
     let processing_timeout = tokio::time::timeout(timeout, processing_handle);
     let persistence_timeout = tokio::time::timeout(timeout, persistence_handle);
+    let sync_timeout = async {
+        if let Some(handle) = sync_handle {
+            if tokio::time::timeout(timeout, handle).await.is_err() {
+                warn!("Remote sync task did not complete within timeout, aborting");
+            }
+        }
+    };
 
-    let (processing_result, persistence_result, capture_health_result) = tokio::join!(
+    let (processing_result, persistence_result, capture_health_result, _) = tokio::join!(
         processing_timeout,
         persistence_timeout,
-        tokio::time::timeout(timeout, capture_health_handle)
+        tokio::time::timeout(timeout, capture_health_handle),
+        sync_timeout,
     );
 
     if processing_result.is_err() {

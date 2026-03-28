@@ -7,20 +7,18 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 
-#[instrument(skip(state, sqlite_pool, pg_pool_option, supabase_option, saving_interval))]
+const SUPABASE_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[instrument(skip(state, sqlite_pool, pg_pool_option, saving_interval))]
 pub async fn save_metrics_periodically(
     state: Arc<MetricsState>,
     sqlite_pool: Pool<Sqlite>,
     pg_pool_option: Option<Pool<Postgres>>,
-    supabase_option: Option<SupabaseClient>,
     identity: DeviceIdentity,
     saving_interval: Duration,
 ) -> Result<()> {
-    // Note: saving_interval is used for both metric persistence and Supabase sync.
-    // Supabase sync happens after each SQLite write, so new rows plus any previously
-    // unsynced rows are all picked up every interval.
     debug!(
         "Starting metrics persistence task with interval: {:?}",
         saving_interval
@@ -78,12 +76,44 @@ pub async fn save_metrics_periodically(
                     error!("Failed to persist metrics to remote Postgres: {}", e);
                 }
             }
-
         }
+    }
+}
 
-        if let Some(ref supabase) = supabase_option {
-            if let Err(e) = db::sync_to_supabase(supabase, &sqlite_pool).await {
+#[instrument(skip(supabase, sqlite_pool, sync_interval))]
+pub async fn sync_to_remote_periodically(
+    supabase: SupabaseClient,
+    sqlite_pool: Pool<Sqlite>,
+    sync_interval: Duration,
+) -> Result<()> {
+    debug!(
+        "Starting remote sync task with interval: {:?}",
+        sync_interval
+    );
+    let mut interval_timer = time::interval(sync_interval);
+
+    loop {
+        interval_timer.tick().await;
+
+        match time::timeout(
+            SUPABASE_SYNC_TIMEOUT,
+            db::sync_to_supabase(&supabase, &sqlite_pool),
+        )
+        .await
+        {
+            Ok(Ok(count)) => {
+                if count > 0 {
+                    debug!("Remote sync completed: {} rows synced", count);
+                }
+            }
+            Ok(Err(e)) => {
                 error!("Failed to sync metrics to Supabase: {}", e);
+            }
+            Err(_) => {
+                warn!(
+                    "Supabase sync timed out after {}s",
+                    SUPABASE_SYNC_TIMEOUT.as_secs()
+                );
             }
         }
     }
