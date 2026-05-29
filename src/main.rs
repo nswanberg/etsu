@@ -5,6 +5,7 @@ mod db;
 mod distance;
 mod error;
 mod input;
+mod journal;
 mod persistence;
 mod platform;
 mod processing;
@@ -72,10 +73,9 @@ async fn main() -> Result<()> {
         error!("Failed to initialize monitor info using GLFW: {}. Distance calculation might be inaccurate or use defaults.", e);
     }
 
-    let local_db_path = settings
-        .get_local_sqlite_path()?
-        .to_string_lossy()
-        .to_string();
+    let local_db_path_buf = settings.get_local_sqlite_path()?;
+    let journal_path = local_db_path_buf.with_file_name("metrics.journal.jsonl");
+    let local_db_path = local_db_path_buf.to_string_lossy().to_string();
     let (sqlite_pool, pg_pool_option) =
         db::setup_database_pools(&local_db_path, &settings.database).await?;
     let supabase_option = db::setup_supabase_client(&settings.database).await;
@@ -150,6 +150,7 @@ async fn main() -> Result<()> {
                 pg_pool_option_clone,
                 identity_clone,
                 saving_interval,
+                journal_path,
             ) => res,
             _ = shutdown_rx2.recv() => {
                 debug!("Persistence task received shutdown signal");

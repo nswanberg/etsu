@@ -1,9 +1,11 @@
 use crate::config::{DeviceIdentity, RemoteDatabaseSettings};
 use crate::error::Result;
+use crate::journal::JournalEntry;
 use chrono::{DateTime, Local, NaiveDateTime, Utc};
 use postgrest::Postgrest;
 use sea_query::{Alias, Expr, Iden, Query, SqliteQueryBuilder};
 use sea_query_binder::SqlxBinder;
+use serde::{Deserialize, Serialize};
 use sqlx::{migrate::Migrator, PgPool, Pool, Postgres, Sqlite, SqlitePool, Transaction};
 use std::path::Path;
 use tracing::{debug, info, instrument, warn};
@@ -49,12 +51,28 @@ enum MetricsSummaryIden {
     TotalScrollSteps,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetricsData {
     pub keypresses: usize,
     pub mouse_clicks: usize,
     pub scroll_steps: usize,
     pub mouse_distance_in: f64,
+}
+
+impl MetricsData {
+    pub fn is_empty(&self) -> bool {
+        self.keypresses == 0
+            && self.mouse_clicks == 0
+            && self.scroll_steps == 0
+            && self.mouse_distance_in == 0.0
+    }
+
+    pub fn add_assign(&mut self, other: &MetricsData) {
+        self.keypresses += other.keypresses;
+        self.mouse_clicks += other.mouse_clicks;
+        self.scroll_steps += other.scroll_steps;
+        self.mouse_distance_in += other.mouse_distance_in;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -68,10 +86,6 @@ impl CaptureTimestamps {
         let utc = Utc::now();
         let local = utc.with_timezone(&Local);
         Self { utc, local }
-    }
-
-    fn utc_naive(&self) -> NaiveDateTime {
-        self.utc.naive_utc()
     }
 
     fn local_naive(&self) -> NaiveDateTime {
@@ -177,7 +191,10 @@ pub async fn run_migrations(
 }
 
 #[instrument(skip(pool))]
-pub async fn load_initial_totals(pool: &Pool<Sqlite>, device_id: &str) -> Result<(usize, usize, usize, f64)> {
+pub async fn load_initial_totals(
+    pool: &Pool<Sqlite>,
+    device_id: &str,
+) -> Result<(usize, usize, usize, f64)> {
     // First try loading from the summary table
     match load_initial_totals_from_summary(pool, device_id).await {
         Ok(totals) => Ok(totals),
@@ -285,7 +302,10 @@ async fn load_initial_totals_from_summary(
 }
 
 #[instrument(skip(pool, identity))]
-pub async fn backfill_sqlite_identity(pool: &Pool<Sqlite>, identity: &DeviceIdentity) -> Result<()> {
+pub async fn backfill_sqlite_identity(
+    pool: &Pool<Sqlite>,
+    identity: &DeviceIdentity,
+) -> Result<()> {
     sqlx::query(
         r#"
         UPDATE metrics
@@ -340,17 +360,17 @@ pub async fn backfill_sqlite_identity(pool: &Pool<Sqlite>, identity: &DeviceIden
     Ok(())
 }
 
-async fn persist_metrics_sqlite_in_tx(
+async fn persist_metrics_journal_entry_sqlite_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
-    data: &MetricsData,
+    entry: &JournalEntry,
     identity: &DeviceIdentity,
 ) -> Result<()> {
+    let data = entry.metrics_data();
     let distance_mi = data.mouse_distance_in / 63360.0;
-    let capture_timestamps = CaptureTimestamps::now();
 
     sqlx::query(
         r#"
-        INSERT INTO metrics (
+        INSERT OR IGNORE INTO metrics (
             keypresses,
             mouse_clicks,
             scroll_steps,
@@ -360,22 +380,24 @@ async fn persist_metrics_sqlite_in_tx(
             device_name,
             timestamp,
             timestamp_local,
-            local_utc_offset_minutes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            local_utc_offset_minutes,
+            journal_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
-        .bind(data.keypresses as i64)
-        .bind(data.mouse_clicks as i64)
-        .bind(data.scroll_steps as i64)
-        .bind(data.mouse_distance_in)
-        .bind(distance_mi)
-        .bind(&identity.device_id)
-        .bind(&identity.device_name)
-        .bind(capture_timestamps.utc_naive())
-        .bind(capture_timestamps.local_naive())
-        .bind(capture_timestamps.local_utc_offset_minutes())
-        .execute(&mut **tx)
-        .await?;
+    .bind(data.keypresses as i64)
+    .bind(data.mouse_clicks as i64)
+    .bind(data.scroll_steps as i64)
+    .bind(data.mouse_distance_in)
+    .bind(distance_mi)
+    .bind(&identity.device_id)
+    .bind(&identity.device_name)
+    .bind(&entry.timestamp_utc)
+    .bind(&entry.timestamp_local)
+    .bind(entry.local_utc_offset_minutes)
+    .bind(&entry.journal_id)
+    .execute(&mut **tx)
+    .await?;
 
     Ok(())
 }
@@ -404,37 +426,20 @@ async fn persist_metrics_postgres_in_tx(
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
     )
-        .bind(data.keypresses as i64)
-        .bind(data.mouse_clicks as i64)
-        .bind(data.scroll_steps as i64)
-        .bind(data.mouse_distance_in)
-        .bind(distance_mi)
-        .bind(&identity.device_id)
-        .bind(&identity.device_name)
-        .bind(capture_timestamps.utc)
-        .bind(capture_timestamps.local_naive())
-        .bind(capture_timestamps.local_utc_offset_minutes())
-        .execute(&mut **tx)
-        .await?;
+    .bind(data.keypresses as i64)
+    .bind(data.mouse_clicks as i64)
+    .bind(data.scroll_steps as i64)
+    .bind(data.mouse_distance_in)
+    .bind(distance_mi)
+    .bind(&identity.device_id)
+    .bind(&identity.device_name)
+    .bind(capture_timestamps.utc)
+    .bind(capture_timestamps.local_naive())
+    .bind(capture_timestamps.local_utc_offset_minutes())
+    .execute(&mut **tx)
+    .await?;
 
     Ok(())
-}
-
-#[instrument(skip(pool, data), fields(db_type = "sqlite"))]
-pub async fn persist_metrics_sqlite(
-    pool: &Pool<Sqlite>,
-    data: &MetricsData,
-    identity: &DeviceIdentity,
-) -> Result<()> {
-    if data.keypresses == 0
-        && data.mouse_clicks == 0
-        && data.scroll_steps == 0
-        && data.mouse_distance_in == 0.0
-    {
-        return Ok(());
-    }
-
-    persist_metrics_transactional_sqlite(pool, data, identity).await
 }
 
 #[instrument(skip(pool, data), fields(db_type = "postgres"))]
@@ -443,37 +448,37 @@ pub async fn persist_metrics_postgres(
     data: &MetricsData,
     identity: &DeviceIdentity,
 ) -> Result<()> {
-    if data.keypresses == 0
-        && data.mouse_clicks == 0
-        && data.scroll_steps == 0
-        && data.mouse_distance_in == 0.0
-    {
+    if data.is_empty() {
         return Ok(());
     }
 
     persist_metrics_transactional_postgres(pool, data, identity).await
 }
 
-#[instrument(skip(pool, data), fields(db_type = "sqlite"))]
-pub async fn persist_metrics_transactional_sqlite(
+#[instrument(skip(pool, entry), fields(db_type = "sqlite", journal_id = %entry.journal_id))]
+pub async fn persist_metrics_journal_entry_sqlite(
     pool: &Pool<Sqlite>,
-    data: &MetricsData,
+    entry: &JournalEntry,
     identity: &DeviceIdentity,
 ) -> Result<()> {
+    if entry.metrics_data().is_empty() {
+        return Ok(());
+    }
+
     let mut tx = pool.begin().await?;
-    let result = persist_metrics_sqlite_in_tx(&mut tx, data, identity).await;
+    let result = persist_metrics_journal_entry_sqlite_in_tx(&mut tx, entry, identity).await;
 
     match result {
         Ok(_) => {
             tx.commit().await?;
             debug!(
-                "SQLite transaction committed for metrics interval: {:?}",
-                data
+                "SQLite transaction committed for journal entry: {}",
+                entry.journal_id
             );
             Ok(())
         }
         Err(e) => {
-            warn!("SQLite transaction failed, rolling back: {}", e);
+            warn!("SQLite journal transaction failed, rolling back: {}", e);
             let _ = tx.rollback().await;
             Err(e)
         }
@@ -516,23 +521,18 @@ pub struct SupabaseClient {
     supports_local_time_columns: bool,
 }
 
-pub async fn setup_supabase_client(
-    settings: &RemoteDatabaseSettings,
-) -> Option<SupabaseClient> {
+pub async fn setup_supabase_client(settings: &RemoteDatabaseSettings) -> Option<SupabaseClient> {
     let url = settings.supabase_url.as_deref().filter(|s| !s.is_empty())?;
-    let api_key = settings.supabase_api_key.as_deref().filter(|s| !s.is_empty())?;
+    let api_key = settings
+        .supabase_api_key
+        .as_deref()
+        .filter(|s| !s.is_empty())?;
 
     let rest_url = format!("{}/rest/v1", url.trim_end_matches('/'));
-    let client = Postgrest::new(&rest_url)
-        .insert_header("apikey", api_key);
+    let client = Postgrest::new(&rest_url).insert_header("apikey", api_key);
 
     // Verify connectivity
-    let resp = client
-        .from("metrics")
-        .select("id")
-        .limit(0)
-        .execute()
-        .await;
+    let resp = client.from("metrics").select("id").limit(0).execute().await;
 
     match resp {
         Ok(r) if r.status().is_success() => {
@@ -615,34 +615,13 @@ pub async fn sync_to_supabase(
             .iter()
             .map(|r| {
                 let mut row = serde_json::Map::from_iter([
-                    (
-                        "keypresses".to_string(),
-                        serde_json::json!(r.1),
-                    ),
-                    (
-                        "mouse_clicks".to_string(),
-                        serde_json::json!(r.2),
-                    ),
-                    (
-                        "scroll_steps".to_string(),
-                        serde_json::json!(r.3),
-                    ),
-                    (
-                        "mouse_distance_in".to_string(),
-                        serde_json::json!(r.4),
-                    ),
-                    (
-                        "mouse_distance_mi".to_string(),
-                        serde_json::json!(r.5),
-                    ),
-                    (
-                        "device_id".to_string(),
-                        serde_json::json!(r.6),
-                    ),
-                    (
-                        "device_name".to_string(),
-                        serde_json::json!(r.7),
-                    ),
+                    ("keypresses".to_string(), serde_json::json!(r.1)),
+                    ("mouse_clicks".to_string(), serde_json::json!(r.2)),
+                    ("scroll_steps".to_string(), serde_json::json!(r.3)),
+                    ("mouse_distance_in".to_string(), serde_json::json!(r.4)),
+                    ("mouse_distance_mi".to_string(), serde_json::json!(r.5)),
+                    ("device_id".to_string(), serde_json::json!(r.6)),
+                    ("device_name".to_string(), serde_json::json!(r.7)),
                     (
                         "timestamp".to_string(),
                         serde_json::json!(sqlite_utc_timestamp_for_remote(&r.8)),
@@ -652,9 +631,7 @@ pub async fn sync_to_supabase(
                 if supabase.supports_local_time_columns {
                     row.insert(
                         "timestamp_local".to_string(),
-                        serde_json::json!(
-                            r.9.as_deref().map(sqlite_local_timestamp_for_remote)
-                        ),
+                        serde_json::json!(r.9.as_deref().map(sqlite_local_timestamp_for_remote)),
                     );
                     row.insert(
                         "local_utc_offset_minutes".to_string(),
