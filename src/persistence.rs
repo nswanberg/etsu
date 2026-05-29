@@ -7,11 +7,12 @@ use sqlx::{Pool, Postgres, Sqlite};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time;
 use tracing::{debug, error, info, instrument, warn};
 
 const SUPABASE_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+const SUPABASE_STALENESS_THRESHOLD: Duration = Duration::from_secs(60 * 60);
 const MAX_CONSECUTIVE_LOCAL_PERSISTENCE_FAILURES: u32 = 3;
 
 #[instrument(skip(state, sqlite_pool, pg_pool_option, saving_interval))]
@@ -182,9 +183,15 @@ pub async fn sync_to_remote_periodically(
         sync_interval
     );
     let mut interval_timer = time::interval(sync_interval);
+    let task_started = Instant::now();
+    let mut last_success: Option<Instant> = None;
+    let mut staleness_warned = false;
+    let mut last_error: Option<String> = None;
 
     loop {
         interval_timer.tick().await;
+
+        db::probe_supabase_local_time_columns(&supabase).await;
 
         match time::timeout(
             SUPABASE_SYNC_TIMEOUT,
@@ -193,18 +200,49 @@ pub async fn sync_to_remote_periodically(
         .await
         {
             Ok(Ok(count)) => {
+                if last_error.is_some() || staleness_warned {
+                    info!("Supabase sync recovered after prior failures.");
+                }
+                last_error = None;
+                last_success = Some(Instant::now());
+                staleness_warned = false;
                 if count > 0 {
                     debug!("Remote sync completed: {} rows synced", count);
                 }
             }
             Ok(Err(e)) => {
-                error!("Failed to sync metrics to Supabase: {}", e);
+                let msg = e.to_string();
+                if last_error.as_deref() != Some(msg.as_str()) {
+                    warn!("Failed to sync metrics to Supabase: {}. Will retry.", msg);
+                    last_error = Some(msg);
+                }
             }
             Err(_) => {
-                warn!(
-                    "Supabase sync timed out after {}s",
-                    SUPABASE_SYNC_TIMEOUT.as_secs()
-                );
+                let msg = format!("timed out after {}s", SUPABASE_SYNC_TIMEOUT.as_secs());
+                if last_error.as_deref() != Some(msg.as_str()) {
+                    warn!("Supabase sync {}. Will retry.", msg);
+                    last_error = Some(msg);
+                }
+            }
+        }
+
+        let since_success = last_success
+            .map(|t| t.elapsed())
+            .unwrap_or_else(|| task_started.elapsed());
+        if since_success >= SUPABASE_STALENESS_THRESHOLD && !staleness_warned {
+            match db::count_unsynced_metrics(&sqlite_pool).await {
+                Ok(unsynced) if unsynced > 0 => {
+                    warn!(
+                        "Supabase sync has not succeeded in {} minute(s); {} row(s) queued locally.",
+                        since_success.as_secs() / 60,
+                        unsynced
+                    );
+                    staleness_warned = true;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    debug!("Failed to query local unsynced row count: {}", e);
+                }
             }
         }
     }

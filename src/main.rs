@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
     let local_db_path = local_db_path_buf.to_string_lossy().to_string();
     let (sqlite_pool, pg_pool_option) =
         db::setup_database_pools(&local_db_path, &settings.database).await?;
-    let supabase_option = db::setup_supabase_client(&settings.database).await;
+    let supabase_option = db::setup_supabase_client(&settings.database);
 
     if let Err(e) = db::run_migrations(&sqlite_pool, &pg_pool_option).await {
         error!(

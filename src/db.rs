@@ -8,6 +8,8 @@ use sea_query_binder::SqlxBinder;
 use serde::{Deserialize, Serialize};
 use sqlx::{migrate::Migrator, PgPool, Pool, Postgres, Sqlite, SqlitePool, Transaction};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
 static SQLITE_MIGRATOR: Migrator = sqlx::migrate!("./migrations/sqlite");
@@ -518,10 +520,11 @@ const SUPABASE_BATCH_SIZE: u32 = 100;
 #[derive(Clone)]
 pub struct SupabaseClient {
     client: Postgrest,
-    supports_local_time_columns: bool,
+    supports_local_time_columns: Arc<AtomicBool>,
+    columns_probed: Arc<AtomicBool>,
 }
 
-pub async fn setup_supabase_client(settings: &RemoteDatabaseSettings) -> Option<SupabaseClient> {
+pub fn setup_supabase_client(settings: &RemoteDatabaseSettings) -> Option<SupabaseClient> {
     let url = settings.supabase_url.as_deref().filter(|s| !s.is_empty())?;
     let api_key = settings
         .supabase_api_key
@@ -531,57 +534,65 @@ pub async fn setup_supabase_client(settings: &RemoteDatabaseSettings) -> Option<
     let rest_url = format!("{}/rest/v1", url.trim_end_matches('/'));
     let client = Postgrest::new(&rest_url).insert_header("apikey", api_key);
 
-    // Verify connectivity
-    let resp = client.from("metrics").select("id").limit(0).execute().await;
+    info!(
+        "Supabase REST sync configured for {} (connectivity verified on first sync attempt)",
+        url
+    );
 
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            info!("Supabase REST API connected at {}", url);
-        }
-        Ok(r) => {
-            warn!(
-                "Supabase REST API returned HTTP {}: check API key and table permissions. Remote sync will be disabled.",
-                r.status()
-            );
-            return None;
-        }
-        Err(e) => {
-            warn!(
-                "Failed to reach Supabase REST API at {}: {}. Remote sync will be disabled.",
-                url, e
-            );
-            return None;
-        }
+    Some(SupabaseClient {
+        client,
+        supports_local_time_columns: Arc::new(AtomicBool::new(false)),
+        columns_probed: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+/// Probe whether the remote metrics table exposes the local-time columns.
+/// Safe to call every sync cycle; becomes a no-op once probed successfully.
+pub async fn probe_supabase_local_time_columns(supabase: &SupabaseClient) {
+    if supabase.columns_probed.load(Ordering::Relaxed) {
+        return;
     }
 
-    let supports_local_time_columns = match client
+    match supabase
+        .client
         .from("metrics")
         .select("timestamp_local,local_utc_offset_minutes")
         .limit(0)
         .execute()
         .await
     {
-        Ok(r) if r.status().is_success() => true,
+        Ok(r) if r.status().is_success() => {
+            supabase
+                .supports_local_time_columns
+                .store(true, Ordering::Relaxed);
+            supabase.columns_probed.store(true, Ordering::Relaxed);
+            info!("Supabase metrics table exposes timestamp_local/local_utc_offset_minutes.");
+        }
         Ok(r) => {
+            supabase
+                .supports_local_time_columns
+                .store(false, Ordering::Relaxed);
+            supabase.columns_probed.store(true, Ordering::Relaxed);
             warn!(
                 "Supabase metrics table does not yet expose timestamp_local/local_utc_offset_minutes (HTTP {}). Continuing without local timestamp sync.",
                 r.status()
             );
-            false
         }
         Err(e) => {
-            warn!(
-                "Failed to probe Supabase local timestamp columns: {}. Continuing without local timestamp sync.",
+            debug!(
+                "Failed to probe Supabase local timestamp columns: {}. Will retry.",
                 e
             );
-            false
         }
-    };
+    }
+}
 
-    Some(SupabaseClient {
-        client,
-        supports_local_time_columns,
-    })
+pub async fn count_unsynced_metrics(sqlite_pool: &Pool<Sqlite>) -> Result<i64> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metrics WHERE supabase_synced_at IS NULL")
+            .fetch_one(sqlite_pool)
+            .await?;
+    Ok(count)
 }
 
 /// Sync all unsynced local SQLite rows to Supabase in batches. Returns the number of rows synced.
@@ -628,7 +639,7 @@ pub async fn sync_to_supabase(
                     ),
                 ]);
 
-                if supabase.supports_local_time_columns {
+                if supabase.supports_local_time_columns.load(Ordering::Relaxed) {
                     row.insert(
                         "timestamp_local".to_string(),
                         serde_json::json!(r.9.as_deref().map(sqlite_local_timestamp_for_remote)),
