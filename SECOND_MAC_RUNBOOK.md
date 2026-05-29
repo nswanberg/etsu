@@ -27,7 +27,7 @@ What this does:
 3. Reinstalls `~/Applications/Etsu.app`
 4. Restarts the LaunchAgent
 5. Preserves the existing machine identity from the local config
-6. Waits for macOS permissions and confirms capture before returning success
+6. Waits for macOS permissions, confirms capture if an input event occurs, and otherwise returns success once permissions are granted
 
 ## If this Mac already has Supabase configured
 
@@ -66,6 +66,7 @@ sqlite3 "$HOME/Library/Application Support/com.seatedro.etsu/etsu.db" \
 
 Expected:
 
-- migration `20260315090000` is present
-- `metrics` includes `timestamp_local` and `local_utc_offset_minutes`
+- migrations `20260315090000` and `20260529080000` are present
+- `metrics` includes `timestamp_local`, `local_utc_offset_minutes`, and `journal_id`
 - new rows show `timestamp` in UTC and the local wall clock alongside it
+- `~/Library/Application Support/com.seatedro.etsu/metrics.journal.jsonl` is normally absent after successful SQLite replay; if it exists, it contains durable pending intervals that ETSU will replay on startup

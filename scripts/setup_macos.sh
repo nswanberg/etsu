@@ -548,6 +548,10 @@ print_startup_status() {
         break
       fi
 
+      if (( permissions_granted_line > waiting_line )); then
+        capture_status="permissions_granted"
+      fi
+
       if (( waiting_line > permissions_granted_line )); then
         capture_status="waiting"
         if (( prompted_user == 0 )); then
@@ -621,6 +625,11 @@ print_startup_status() {
   case "$capture_status" in
     confirmed)
       note "Input capture: confirmed -- ETSU is recording keystrokes and mouse events."
+      return 0
+      ;;
+    permissions_granted)
+      note "Input capture: permissions granted for $INSTALLED_BIN_PATH."
+      note "No input event was observed during the setup wait window; ETSU is running and will log capture confirmation on the next keyboard or mouse event."
       return 0
       ;;
     waiting)

@@ -122,7 +122,7 @@ That script:
 - installs the LaunchAgent at `~/Library/LaunchAgents/com.seatedro.etsu.plist`
 - waits for macOS Input Monitoring and Accessibility permissions to be granted
 - auto-restarts ETSU after permissions are granted (macOS requires a restart)
-- confirms input capture is working before finishing
+- confirms input capture when an input event occurs, or finishes once permissions are granted so already-permitted installs do not hang on idle machines
 
 If you want to run the pieces manually:
 
